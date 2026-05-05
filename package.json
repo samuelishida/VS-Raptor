@@ -1,0 +1,113 @@
+{
+	"name": "raptor-vscode-extension",
+	"displayName": "raptor",
+	"version": "0.2.0",
+	"description": "VS Raptor Extension",
+	"license": "UNLICENSED",
+	"categories": [
+		"Other",
+		"AI"
+	],
+	"main": "./dist/extension.js",
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch --p \"./\""
+	},
+	"devDependencies": {
+		"@types/node": "^20",
+		"@types/vscode": "^1.8.0",
+		"typescript": "^5.0.0"
+	},
+	"engines": {
+		"vscode": "^1.102.0"
+	},
+	"publisher": "your-publisher-name",
+	"activationEvents": [
+		"onChatParticipant:raptor.agent",
+		"onCommand:raptor.openPanel",
+		"onCommand:raptor.runInTerminal",
+		"onCommand:raptor.steer"
+	],
+	"contributes": {
+		"commands": [
+			{
+				"command": "raptor.openPanel",
+				"title": "raptor: Open Chat Panel"
+			},
+			{
+				"command": "raptor.runInTerminal",
+				"title": "raptor: Run Selection In Terminal"
+			},
+			{
+				"command": "raptor.steer",
+				"title": "raptor: Steer Running Agent"
+			}
+		],
+		"chatParticipants": [
+			{
+				"id": "raptor.agent",
+				"name": "raptor",
+				"fullName": "raptor Agent",
+				"description": "Autonomous coding assistant with file, terminal, and memory tools.",
+				"isSticky": true,
+				"commands": [
+					{
+						"name": "help",
+						"description": "Show help and available tools"
+					},
+					{
+						"name": "memory",
+						"description": "Show saved persistent memory"
+					},
+					{
+						"name": "resume",
+						"description": "Resume from previous session context"
+					},
+					{
+						"name": "todos",
+						"description": "Show current todo list"
+					},
+					{
+						"name": "clearmemory",
+						"description": "Clear persistent memory"
+					},
+					{
+						"name": "steer",
+						"description": "Inject guidance into a running session"
+					}
+				]
+			}
+		],
+		"configuration": {
+			"title": "raptor",
+			"properties": {
+				"raptor.maxIterations": {
+					"type": "number",
+					"default": 100,
+					"minimum": 1,
+					"description": "Maximum iterations for the main agent loop per request."
+				},
+				"raptor.spawnAgentMaxIterations": {
+					"type": "number",
+					"default": 60,
+					"minimum": 1,
+					"description": "Maximum iterations for spawned sub-agents."
+				},
+				"raptor.model": {
+					"type": "string",
+					"default": "claude-sonnet-4.6",
+					"description": "Preferred fallback model when no session-selected model is available."
+				}
+			}
+		}
+	},
+	"dependencies": {
+		"vsce": "^2.15.0"
+	},
+	"__metadata": {
+		"installedTimestamp": 1775461056055,
+		"targetPlatform": "undefined",
+		"size": 297653
+	}
+}
