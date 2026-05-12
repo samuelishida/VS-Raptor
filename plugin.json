@@ -1,0 +1,15 @@
+{
+  "name": "raptor",
+  "displayName": "Raptor",
+  "version": "0.2.0",
+  "description": "Agent orchestrator with specialist skills for coding workflows — plan, audit, fix bugs, refactor, review PRs, and build custom agent flows.",
+  "keywords": ["coding", "agent", "orchestrator", "workflow", "audit", "review", "planning"],
+  "skills": "./skills",
+  "agents": "./agents",
+  "author": {
+    "name": "Samuel Ishida"
+  },
+  "engines": {
+    "claude-code": ">=1.0.0"
+  }
+}

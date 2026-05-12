@@ -3,11 +3,15 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
 import { spawn } from 'child_process'
+import { getConfig } from './src/config/model'
 import {
-  getConfig,
-  pickPreferredChatModel,
-  resolveModelForRequest,
-} from './src/config/model'
+  getConfig as getLoadedConfig,
+  filterToolsByAgent,
+  getSkillContent,
+  type Agent,
+  type Flow,
+  type LoadedConfig,
+} from './src/config/loader'
 import { registerChatParticipant as registerChatParticipantModule } from './src/chat/participant'
 import { renderToolResultDropdown } from './src/chat/tool-result-render'
 import { buildSystemPrompt } from './src/chat/system-prompt'
@@ -27,17 +31,58 @@ import {
   shortenPath,
   workspaceRoot,
 } from './src/utils/paths'
+import {
+  createProviderRegistry,
+  type ProviderRegistry,
+} from './src/providers/registry'
+import { createVSCodeProvider } from './src/providers/vscode'
+import { createAnthropicProvider } from './src/providers/anthropic'
+import { createOpenAIProvider } from './src/providers/openai'
+import { createOpenRouterProvider } from './src/providers/openrouter'
+import { createOllamaProvider } from './src/providers/ollama'
+import { createClaudeCodeProvider } from './src/providers/claude-code'
+import { createCodexProvider } from './src/providers/codex-cli'
+import { createOpenCodeProvider } from './src/providers/opencode-cli'
+import {
+  type RaptorMessage,
+  type RaptorTextPart,
+  type RaptorToolCallPart,
+  type RaptorToolResultPart,
+  type RaptorResponseEvent,
+  type RaptorModel,
+  type ResolvedModel,
+  ProviderError,
+} from './src/providers/types'
+import {
+  buildRuntimeMessages,
+  appendToolResult,
+  appendToolResultToMessages,
+  compactRuntimeMessages,
+  toRaptorMessages,
+  fromRaptorMessages,
+} from './src/chat/message-adapter'
+import { loadProviderConfigs, logProviderStatus } from './src/providers/config'
 
 // ─── Module-level singletons ───────────────────────────────────────────────────
 
 let outputChannel: vscode.OutputChannel | undefined
 let extContext: vscode.ExtensionContext | undefined
+let providerRegistry: ProviderRegistry | undefined
+
+function getRegistry(): ProviderRegistry {
+  if (!providerRegistry) {
+    throw new Error('Provider registry not initialized')
+  }
+  return providerRegistry
+}
 
 // ── Steering buffer ────────────────────────────────────────────────────────────
 // Allows users to inject guidance mid-flight via `/steer <message>` or the
 // `raptor.steer` command. The agent loop drains this buffer each iteration and
 // injects the messages as new User turns so the LLM sees them immediately.
 const steeringBuffer: string[] = []
+let activeAgentId: string = '_default'
+let activeModelSpec: string | undefined
 
 function pushSteering(msg: string): void {
   steeringBuffer.push(msg)
@@ -45,6 +90,32 @@ function pushSteering(msg: string): void {
 
 function drainSteering(): string[] {
   return steeringBuffer.splice(0, steeringBuffer.length)
+}
+
+function setActiveAgent(id: string): void {
+  activeAgentId = id
+}
+
+function getActiveAgentId(): string {
+  return activeAgentId
+}
+
+function setActiveModelSpec(model: string | undefined): void {
+  activeModelSpec = model?.trim() || undefined
+}
+
+function getActiveModelSpec(): string | undefined {
+  return activeModelSpec
+}
+
+function getConfiguredFallbackModel(): string {
+  return vscode.workspace.getConfiguration('raptor').get<string>('model', 'claude-sonnet-4.6')
+}
+
+function getCommandArgs(prompt: string, commandName: string): string {
+  const trimmed = prompt.trim()
+  const slash = new RegExp(`^/${commandName}\\b\\s*`)
+  return trimmed.replace(slash, '').trim()
 }
 
 /** Persistent data directory (~/.raptor by default). */
@@ -238,19 +309,19 @@ const MICRO_COMPACT_THRESHOLD  = 60_000
 const FULL_COMPACT_THRESHOLD   = 85_000
 const MICRO_COMPACT_TOOL_LIMIT = 2_048
 
-function estimateTokens(messages: vscode.LanguageModelChatMessage[]): number {
+function estimateTokens(messages: RaptorMessage[]): number {
   let total = 0
   for (const msg of messages) {
     for (const part of msg.content) {
-      if (part instanceof vscode.LanguageModelTextPart) {
+      if (part.type === 'text') {
         total += part.value.length / TOKEN_ESTIMATE_RATIO
-      } else if (part instanceof vscode.LanguageModelToolResultPart) {
+      } else if (part.type === 'tool_result') {
         for (const c of part.content) {
-          if (c instanceof vscode.LanguageModelTextPart) {
+          if (c.type === 'text') {
             total += c.value.length / TOKEN_ESTIMATE_RATIO
           }
         }
-      } else if (part instanceof vscode.LanguageModelToolCallPart) {
+      } else if (part.type === 'tool_call') {
         total += JSON.stringify(part.input).length / TOKEN_ESTIMATE_RATIO
       }
     }
@@ -259,41 +330,39 @@ function estimateTokens(messages: vscode.LanguageModelChatMessage[]): number {
 }
 
 function microCompactMessages(
-  messages: vscode.LanguageModelChatMessage[],
+  messages: RaptorMessage[],
   keepRecentTurns = 4,
-): vscode.LanguageModelChatMessage[] {
+): RaptorMessage[] {
   const cutoff = Math.max(2, messages.length - keepRecentTurns * 2)
   return messages.map((msg, idx) => {
     if (idx >= cutoff) return msg
     let changed = false
     const newParts = msg.content.map(part => {
-      if (!(part instanceof vscode.LanguageModelToolResultPart)) return part
+      if (part.type !== 'tool_result') return part
       const newContent = part.content.map(c => {
-        if (!(c instanceof vscode.LanguageModelTextPart)) return c
+        if (c.type !== 'text') return c
         if (c.value.length <= MICRO_COMPACT_TOOL_LIMIT) return c
         changed = true
         const preview = c.value.slice(0, MICRO_COMPACT_TOOL_LIMIT)
-        return new vscode.LanguageModelTextPart(
-          preview + `\n...[compacted: ${c.value.length} chars -> ${MICRO_COMPACT_TOOL_LIMIT}]`,
-        )
+        return { type: 'text' as const, value: preview + `\n...[compacted: ${c.value.length} chars -> ${MICRO_COMPACT_TOOL_LIMIT}]` }
       })
-      return new vscode.LanguageModelToolResultPart(part.callId, newContent)
+      return { type: 'tool_result' as const, callId: part.callId, content: newContent }
     })
     if (!changed) return msg
-    return new vscode.LanguageModelChatMessage(msg.role, newParts as vscode.LanguageModelInputPart[])
+    return { role: msg.role, content: newParts }
   })
 }
 
 async function fullCompactMessages(
-  messages: vscode.LanguageModelChatMessage[],
-  model: vscode.LanguageModelChat,
+  messages: RaptorMessage[],
+  resolved: ResolvedModel,
   token: vscode.CancellationToken,
-): Promise<vscode.LanguageModelChatMessage[]> {
+): Promise<RaptorMessage[]> {
   const convoText = messages
     .map(m => {
-      const role = m.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant'
+      const role = m.role === 'user' ? 'User' : 'Assistant'
       const text = m.content
-        .filter((p): p is vscode.LanguageModelTextPart => p instanceof vscode.LanguageModelTextPart)
+        .filter((p): p is RaptorTextPart => p.type === 'text')
         .map(p => p.value).join(' ')
       return `${role}: ${text.slice(0, 2000)}`
     }).join('\n\n').slice(0, 40_000)
@@ -306,23 +375,19 @@ async function fullCompactMessages(
   ].join('\n')
 
   try {
-    const resp = await model.sendRequest(
-      [vscode.LanguageModelChatMessage.User(summaryPrompt)], {}, token,
+    const stream = await resolved.provider.sendRequest(
+      resolved.model,
+      [{ role: 'user', content: [{ type: 'text', value: summaryPrompt }] }],
+      {},
+      token,
     )
     let summary = ''
-    for await (const part of resp.stream) {
-      if (part instanceof vscode.LanguageModelTextPart) summary += part.value
+    for await (const part of stream) {
+      if (part.type === 'text') summary += part.value
     }
-    const systemMessages = messages.slice(0, 2)
+    const systemMessages = messages.filter(m => m.role === 'system')
     const recentMessages = messages.slice(-4)
-    return [
-      ...systemMessages,
-      vscode.LanguageModelChatMessage.User(
-        `[CONVERSATION SUMMARY -- context was compacted]\n\n${summary}`,
-      ),
-      vscode.LanguageModelChatMessage.Assistant('Understood. Continuing from the summary above.'),
-      ...recentMessages,
-    ]
+    return compactRuntimeMessages(messages, systemMessages, summary, recentMessages)
   } catch {
     return microCompactMessages(messages, 6)
   }
@@ -371,7 +436,7 @@ interface ConversationSnapshot {
 }
 
 async function saveConversationHistory(
-  messages: vscode.LanguageModelChatMessage[],
+  messages: RaptorMessage[],
   totalToolCalls: number,
 ): Promise<void> {
   try {
@@ -382,9 +447,9 @@ async function saveConversationHistory(
       timestamp: new Date().toISOString(),
       totalToolCalls,
       messages: messages.slice(1).map(m => ({
-        role: m.role === vscode.LanguageModelChatMessageRole.User ? 'user' as const : 'assistant' as const,
+        role: m.role === 'user' ? 'user' as const : 'assistant' as const,
         text: m.content
-          .filter((p): p is vscode.LanguageModelTextPart => p instanceof vscode.LanguageModelTextPart)
+          .filter((p): p is RaptorTextPart => p.type === 'text')
           .map(p => p.value).join(' ')
           .slice(0, 5000),
       })).filter(m => m.text.trim()),
@@ -417,15 +482,15 @@ async function loadRecentHistory(): Promise<ConversationSnapshot | null> {
 }
 
 async function generateSessionSummary(
-  messages: vscode.LanguageModelChatMessage[],
-  model: vscode.LanguageModelChat,
+  messages: RaptorMessage[],
+  resolved: ResolvedModel,
   token: vscode.CancellationToken,
 ): Promise<string> {
-  const convoText = messages.slice(2)
+  const convoText = messages.filter(m => m.role !== 'system')
     .map(m => {
-      const role = m.role === vscode.LanguageModelChatMessageRole.User ? 'User' : 'Assistant'
+      const role = m.role === 'user' ? 'User' : 'Assistant'
       const text = m.content
-        .filter((p): p is vscode.LanguageModelTextPart => p instanceof vscode.LanguageModelTextPart)
+        .filter((p): p is RaptorTextPart => p.type === 'text')
         .map(p => p.value).join(' ')
       return `${role}: ${text.slice(0, 1500)}`
     }).join('\n\n').slice(0, 30_000)
@@ -440,12 +505,15 @@ async function generateSessionSummary(
   ].join('\n')
 
   try {
-    const resp = await model.sendRequest(
-      [vscode.LanguageModelChatMessage.User(prompt)], {}, token,
+    const stream = await resolved.provider.sendRequest(
+      resolved.model,
+      [{ role: 'user', content: [{ type: 'text', value: prompt }] }],
+      {},
+      token,
     )
     let summary = ''
-    for await (const part of resp.stream) {
-      if (part instanceof vscode.LanguageModelTextPart) summary += part.value
+    for await (const part of stream) {
+      if (part.type === 'text') summary += part.value
     }
     return summary.trim()
   } catch {
@@ -541,10 +609,69 @@ async function extractAndStoreMemories(
 
 // ─── Activation ───────────────────────────────────────────────────────────────
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extContext = context
   outputChannel = vscode.window.createOutputChannel('raptor')
   context.subscriptions.push(outputChannel)
+
+  providerRegistry = createProviderRegistry(context)
+  providerRegistry.register(createVSCodeProvider())
+
+  const configs = await loadProviderConfigs(context)
+  for (const [id, cfg] of Object.entries(configs)) {
+    if (!cfg.enabled) {
+      logProviderStatus(id, 'disabled', logToOutput)
+      continue
+    }
+
+    switch (id) {
+      case 'vscode': continue
+      case 'anthropic': {
+        const apiKey = cfg.apiKey
+        const deprecatedKey = vscode.workspace.getConfiguration('raptor').get<string>('provider.anthropic.apiKey', '')
+        getRegistry().register(createAnthropicProvider({ apiKey: apiKey || deprecatedKey, baseUrl: cfg.baseUrl }))
+        if (deprecatedKey && !apiKey) {
+          logToOutput('[provider] Anthropic: using deprecated plain-text API key setting. Migrate to VS Code SecretStorage.')
+        }
+        break
+      }
+      case 'openai': {
+        const apiKey = cfg.apiKey
+        const deprecatedKey = vscode.workspace.getConfiguration('raptor').get<string>('provider.openai.apiKey', '')
+        getRegistry().register(createOpenAIProvider({ apiKey: apiKey || deprecatedKey, baseUrl: cfg.baseUrl }))
+        if (deprecatedKey && !apiKey) {
+          logToOutput('[provider] OpenAI: using deprecated plain-text API key setting. Migrate to VS Code SecretStorage.')
+        }
+        break
+      }
+      case 'openrouter': {
+        const apiKey = cfg.apiKey
+        const deprecatedKey = vscode.workspace.getConfiguration('raptor').get<string>('provider.openrouter.apiKey', '')
+        getRegistry().register(createOpenRouterProvider({ apiKey: apiKey || deprecatedKey, baseUrl: cfg.baseUrl }))
+        if (deprecatedKey && !apiKey) {
+          logToOutput('[provider] OpenRouter: using deprecated plain-text API key setting. Migrate to VS Code SecretStorage.')
+        }
+        break
+      }
+      case 'ollama': {
+        getRegistry().register(createOllamaProvider({ baseUrl: cfg.baseUrl || 'http://localhost:11434' }))
+        break
+      }
+      case 'claude-code': {
+        getRegistry().register(createClaudeCodeProvider({ apiKey: cfg.apiKey, model: cfg.defaultModel, command: cfg.command }))
+        break
+      }
+      case 'codex': {
+        getRegistry().register(createCodexProvider({ apiKey: cfg.apiKey, model: cfg.defaultModel, command: cfg.command }))
+        break
+      }
+      case 'opencode': {
+        getRegistry().register(createOpenCodeProvider({ apiKey: cfg.apiKey, model: cfg.defaultModel, command: cfg.command }))
+        break
+      }
+    }
+  }
+
   registerChatParticipant(context)
   registerCommands(context)
   // Ensure persistent + temp dirs exist early.
@@ -709,6 +836,29 @@ async function dispatchTool(name: string, input: ToolInput, token?: vscode.Cance
     case 'spawnAgent':     return toolSpawnAgent(input)
     default: return `Unknown tool: ${name}`
   }
+}
+
+async function executeToolCallsInOrder(
+  toolCalls: RaptorToolCallPart[],
+  token?: vscode.CancellationToken,
+): Promise<Array<{ toolCall: RaptorToolCallPart; result: string }>> {
+  if (toolCalls.length > 1) {
+    console.warn('[Tool Dispatch] Multiple tools requested; executing sequentially to preserve result order:', toolCalls.map(t => t.name).join(', '))
+  }
+
+  const results: Array<{ toolCall: RaptorToolCallPart; result: string }> = []
+  for (const toolCall of toolCalls) {
+    if (token?.isCancellationRequested) break
+    const input = toolCall.input as Record<string, unknown>
+    let result: string
+    try {
+      result = await dispatchTool(toolCall.name, input, token)
+    } catch (err) {
+      result = `Error: ${String(err)}`
+    }
+    results.push({ toolCall, result })
+  }
+  return results
 }
 
 // ── readFile ─────────────────────────────────────────────────────────────
@@ -1438,8 +1588,11 @@ async function toolRunTerminal(input: ToolInput): Promise<string> {
 async function toolWebFetch(input: ToolInput): Promise<string> {
   const url = input['url'] as string
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const res = await (globalThis as any).fetch(url, {
+    const fetchFn = globalThis.fetch
+    if (typeof fetchFn !== 'function') {
+      throw new Error('fetch is not available in this environment')
+    }
+    const res = await fetchFn(url, {
       headers: { 'User-Agent': 'raptor-vscode/0.0.1' },
       signal: AbortSignal.timeout(15_000),
     })
@@ -1682,10 +1835,18 @@ async function toolSpawnAgent(input: ToolInput): Promise<string> {
 
   if (!task?.trim()) return 'Error: task is required'
 
-  const availableModels = await vscode.lm.selectChatModels()
-  const picked = pickPreferredChatModel(availableModels, getConfig().preferredModel)
-  const model = picked.model
-  if (!model) return 'Error: no model available for sub-agent'
+  const loaded = await getLoadedConfig()
+  const activeAgent = loaded.agents.get(getActiveAgentId()) ?? loaded.agents.get('_default')!
+  const allToolNames = getToolDefs().map(t => t.name)
+  const agentAllowed = filterToolsByAgent(allToolNames, activeAgent.tools)
+  const effectiveTools = toolsAllowed.filter(t => agentAllowed.includes(t))
+
+  let resolved: ResolvedModel
+  try {
+    resolved = await getRegistry().resolve({ agentModel: activeAgent.model })
+  } catch (err) {
+    return 'Error: no model available for sub-agent'
+  }
 
   const subSystemPrompt = [
     `You are a sub-agent spawned to complete a specific scoped task.`,
@@ -1699,13 +1860,12 @@ async function toolSpawnAgent(input: ToolInput): Promise<string> {
     `5. If you cannot complete the task, explain why starting with "BLOCKED: ".`,
   ].join('\n')
 
-  const subMessages: vscode.LanguageModelChatMessage[] = [
-    vscode.LanguageModelChatMessage.User(subSystemPrompt),
-    vscode.LanguageModelChatMessage.Assistant('Understood. I will complete this task autonomously.'),
-    vscode.LanguageModelChatMessage.User('Begin the task now.'),
+  const subMessages: RaptorMessage[] = [
+    { role: 'system', content: [{ type: 'text', value: subSystemPrompt }] },
+    { role: 'user', content: [{ type: 'text', value: 'Begin the task now.' }] },
   ]
 
-  const subTools = getToolDefs().filter((tool: vscode.LanguageModelChatTool) => toolsAllowed.includes(tool.name))
+  const subTools = getToolDefs().filter((tool: vscode.LanguageModelChatTool) => effectiveTools.includes(tool.name))
 
   logToOutput(`[sub-agent] spawned for: ${task.slice(0, 100)}`)
 
@@ -1714,45 +1874,32 @@ async function toolSpawnAgent(input: ToolInput): Promise<string> {
 
   while (iteration < maxIter) {
     iteration++
-    let response: vscode.LanguageModelChatResponse
+    let responseStream: AsyncIterable<RaptorResponseEvent>
     try {
-      response = await model.sendRequest(
-        subMessages, { tools: subTools }, new vscode.CancellationTokenSource().token,
+      responseStream = await resolved.provider.sendRequest(
+        resolved.model,
+        subMessages,
+        { tools: subTools },
+        new vscode.CancellationTokenSource().token,
       )
     } catch (err) { return `Sub-agent model error: ${String(err)}` }
 
-    const textParts: vscode.LanguageModelTextPart[] = []
-    const toolCalls: vscode.LanguageModelToolCallPart[] = []
+    const textParts: RaptorTextPart[] = []
+    const toolCalls: RaptorToolCallPart[] = []
 
-    for await (const part of response.stream) {
-      if (part instanceof vscode.LanguageModelTextPart) textParts.push(part)
-      else if (part instanceof vscode.LanguageModelToolCallPart) toolCalls.push(part)
+    for await (const part of responseStream) {
+      if (part.type === 'text') textParts.push({ type: 'text', value: part.value })
+      else if (part.type === 'tool_call') toolCalls.push({ type: 'tool_call', callId: part.callId, name: part.name, input: part.input })
     }
 
     finalText = textParts.map(p => p.value).join('')
     if (toolCalls.length === 0) break
 
-    subMessages.push(new vscode.LanguageModelChatMessage(
-      vscode.LanguageModelChatMessageRole.Assistant, [...textParts, ...toolCalls],
-    ))
+    appendToolResult(subMessages, textParts, toolCalls)
 
-    const settled = await Promise.allSettled(
-      toolCalls.map(async tc => {
-        let result: string
-        try { result = await dispatchTool(tc.name, tc.input as ToolInput) }
-        catch (e) { result = `Error: ${String(e)}` }
-        return { tc, result }
-      }),
-    )
-
-    for (const s of settled) {
-      const { tc, result } = s.status === 'fulfilled'
-        ? s.value
-        : { tc: toolCalls[settled.indexOf(s)], result: `Error: ${String((s as PromiseRejectedResult).reason)}` }
-      subMessages.push(new vscode.LanguageModelChatMessage(
-        vscode.LanguageModelChatMessageRole.User,
-        [new vscode.LanguageModelToolResultPart(tc.callId, [new vscode.LanguageModelTextPart(result)])],
-      ))
+    const results = await executeToolCallsInOrder(toolCalls)
+    for (const { toolCall, result } of results) {
+      appendToolResultToMessages(subMessages, toolCall.callId, result)
     }
   }
 
@@ -1866,19 +2013,172 @@ async function handleChatRequest(
     return {}
   }
 
-  const { model, source, available } = await resolveModelForRequest(request, config.preferredModel)
-  if (!model) {
-    stream.markdown('No chat model available. Install/configure a chat model provider (Copilot, Ollama, etc.) and sign in if required.')
+  // ── Load config (agents, skills, flows) ───────────────────────────────────
+  const loaded = await getLoadedConfig()
+  for (const w of loaded.warnings) {
+    logToOutput(`[config] ${w}`)
+  }
+  if (loaded.sources.length > 0) {
+    logToOutput(`[config] Loaded from: ${loaded.sources.join(', ')}`)
+    logToOutput(`[config] Agents: ${Array.from(loaded.agents.keys()).join(', ')}`)
+    logToOutput(`[config] Skills: ${Array.from(loaded.skills.keys()).join(', ')}`)
+    logToOutput(`[config] Flows: ${Array.from(loaded.flows.keys()).join(', ')}`)
+  }
+
+  // ── /agents — list loaded agents ──────────────────────────────────────────
+  if (request.command === 'agents' || promptTrimmed === '/agents') {
+    const rows = Array.from(loaded.agents.values()).map(a => {
+      const tools = a.tools === null ? 'all' : (a.tools?.join(', ') ?? 'all')
+      return `| \`${a.id}\` | ${a.name ?? a.id} | ${a.description ?? '-'} | ${a.model ?? '-'} | ${tools} |`
+    })
+    stream.markdown([
+      '## Agents',
+      '',
+      '| ID | Name | Description | Model | Tools |',
+      '|---|---|---|---|---|',
+      ...rows,
+      '',
+      'Use `/agent <id>` to switch agent for the session.',
+    ].join('\n'))
+    return {}
+  }
+
+  // ── /agent <id> — switch active agent ─────────────────────────────────────
+  if (request.command === 'agent' || promptTrimmed.startsWith('/agent ')) {
+    const agentArgs = getCommandArgs(promptTrimmed, 'agent')
+    const agentId = agentArgs.split(/\s+/)[0] ?? ''
+    if (!agentId) {
+      stream.markdown('Usage: `/agent <id>` -- switch to a loaded agent. Use `/agents` to list.')
+      return {}
+    }
+    const agent = loaded.agents.get(agentId)
+    if (!agent) {
+      stream.markdown(`Agent "${agentId}" not found. Use \`/agents\` to list available agents.`)
+      return {}
+    }
+    // Inject a hidden marker into chat history so future turns remember the agent
+    setActiveAgent(agent.id)
+    setActiveModelSpec(agent.model)
+    const modelLine = agent.model
+      ? `\n\nDefault model for this Raptor session is now \`${agent.model}\`.`
+      : `\n\nDefault model for this Raptor session is now the configured fallback \`${getConfiguredFallbackModel()}\`.`
+    stream.markdown(`Switched to agent **${agent.name ?? agent.id}** (${agent.description ?? 'no description'}).${modelLine}`)
+    return { metadata: { activeAgent: agent.id, activeModel: agent.model ?? null } }
+  }
+
+  // ── /flows — list loaded flows ────────────────────────────────────────────
+  if (request.command === 'flows' || promptTrimmed === '/flows') {
+    const rows = Array.from(loaded.flows.values()).map(f => {
+      const steps = f.steps.map((s, i) => `${i + 1}. ${s.agent}: ${s.instruction.slice(0, 60)}${s.instruction.length > 60 ? '…' : ''}`).join('\n')
+      return `| \`${f.id}\` | ${f.name ?? f.id} | ${f.description ?? '-'} | ${f.steps.length} |`
+    })
+    stream.markdown([
+      '## Flows',
+      '',
+      '| ID | Name | Description | Steps |',
+      '|---|---|---|---|',
+      ...rows,
+      '',
+      'Use `/flow <id>` to run a flow.',
+    ].join('\n'))
+    return {}
+  }
+
+  if (request.command === 'models' || promptTrimmed === '/models') {
+    const registry = getRegistry()
+    const providers = registry.listProviders()
+    const rows: string[] = []
+    for (const p of providers) {
+      const providerStatus = p.getStatus ? await p.getStatus().catch(() => ({ available: false, reason: 'status check failed' })) : null
+      const models = await p.listModels().catch(() => [])
+      const available = providerStatus ? providerStatus.available : models.length > 0
+      const statusIcon = available ? '✓' : '✗'
+      const modelList = models.map(m => m.id).join(', ') || (providerStatus && !providerStatus.available && providerStatus.reason ? `(${providerStatus.reason})` : '(no models)')
+      rows.push(`| \`${p.id}\` | ${p.name} | ${p.capability} | ${statusIcon} | ${modelList} |`)
+    }
+    stream.markdown([
+      '## Available Providers',
+      '',
+      '| ID | Name | Capability | Status | Models / Reason |',
+      '|---|---|---|---|---|',
+      ...rows,
+      '',
+      'Capabilities: `native-tools` = full tool loop, `native-text` = text only, `delegated` = CLI subprocess, `unavailable` = not configured.',
+      'Use provider-qualified model specs like `anthropic:claude-sonnet-4-20250514`, `ollama:llama3.1`, `claude-code:sonnet`.',
+    ].join('\n'))
+    return {}
+  }
+
+  if (request.command === 'flow' || promptTrimmed.startsWith('/flow ')) {
+    const flowArgs = getCommandArgs(promptTrimmed, 'flow')
+    const flowParts = flowArgs.split(/\s+/).filter(Boolean)
+    const flowId = flowParts[0] ?? ''
+    const allowModelChanges = flowParts.includes('--accept-models')
+    const keepCurrentModel = flowParts.includes('--keep-current')
+    if (!flowId) {
+      stream.markdown('Usage: `/flow <id>` -- run a loaded flow. Use `/flows` to list.')
+      return {}
+    }
+    const flow = loaded.flows.get(flowId)
+    if (!flow) {
+      stream.markdown(`Flow "${flowId}" not found. Use \`/flows\` to list available flows.`)
+      return {}
+    }
+    const currentAgent = loaded.agents.get(inferActiveAgent(chatContext)) ?? loaded.agents.get('_default')!
+    const currentModelSpec = currentAgent.model ?? inferActiveModel(chatContext) ?? getConfiguredFallbackModel()
+    const modelChanges = collectFlowModelChanges(flow, loaded, currentModelSpec)
+    if (modelChanges.length > 0 && !allowModelChanges && !keepCurrentModel) {
+      const rows = modelChanges.map(change =>
+        `| ${change.step} | \`${change.agent}\` | \`${change.from}\` | \`${change.to}\` |`
+      )
+      stream.markdown([
+        `Flow **${flow.name ?? flow.id}** wants to change models between steps.`,
+        '',
+        '| Step | Agent | Current/Previous | Requested |',
+        '|---|---|---|---|',
+        ...rows,
+        '',
+        `Reply with \`/flow ${flow.id} --accept-models\` to use the flow's configured models, or \`/flow ${flow.id} --keep-current\` to run every step with \`${currentModelSpec}\`.`,
+      ].join('\n'))
+      return {}
+    }
+    await runFlow(flow, loaded, request, chatContext, stream, token, { allowModelChanges, keepCurrentModel, currentModelSpec })
+    return {}
+  }
+
+  // ── Determine active agent from history metadata ──────────────────────────
+  const activeAgentId = inferActiveAgent(chatContext)
+  const activeAgent = loaded.agents.get(activeAgentId) ?? loaded.agents.get('_default')!
+  setActiveAgent(activeAgent.id)
+  setActiveModelSpec(activeAgent.model ?? inferActiveModel(chatContext))
+  const requestedModelSpec = activeAgent.model ?? getActiveModelSpec()
+
+  let resolved: ResolvedModel
+  try {
+    resolved = await getRegistry().resolve({
+      agentModel: requestedModelSpec,
+      fallbackModel: requestedModelSpec ?? getConfiguredFallbackModel(),
+    })
+  } catch (err) {
+    const errMsg = err instanceof ProviderError ? err.message : String(err)
+    stream.markdown(`No chat model available: ${errMsg}\n\nInstall/configure a chat model provider (Copilot, Ollama, etc.) and sign in if required.`)
     return {}
   }
 
   // ── Build messages + inject memory ─────────────────────────────────────────
-  const messages = await buildMessages(chatContext, request)
-  const tools    = getToolDefs()
+  const messages = await buildMessages(chatContext, request, activeAgent, loaded)
+  if (request.command === 'build-flow') {
+    injectBuildFlowCommand(messages)
+  }
+  const allToolNames = getToolDefs().map(t => t.name)
+  const allowedToolNames = filterToolsByAgent(allToolNames, activeAgent.tools)
+  const requestedTools = getToolDefs().filter(t => allowedToolNames.includes(t.name))
+  const tools = resolved.provider.supportsTools(resolved.model) ? requestedTools : []
 
-  const hasOllama = available.some(m => /ollama/i.test(m.vendor) || /ollama/i.test(m.id) || /ollama/i.test(m.family))
-  const availabilityNote = `${available.length} model${available.length === 1 ? '' : 's'} detected${hasOllama ? ', includes Ollama' : ''}`
-  stream.progress(`raptor -> ${model.name} (${source}; ${availabilityNote})`)
+  const availabilityNote = `${resolved.available.length} model${resolved.available.length === 1 ? '' : 's'} detected`
+  const capNote = tools.length === 0 ? ' (text-only provider)' : ''
+  stream.progress(`raptor -> ${resolved.model.name} (${resolved.source}; ${availabilityNote}${capNote})`)
+  stream.markdown(`> **Model:** \`${resolved.provider.id}:${resolved.model.id}\` (${resolved.source})\n\n`)
 
   const MAX_ITERATIONS = config.maxIterations
   let iteration = 0
@@ -1890,17 +2190,13 @@ async function handleChatRequest(
     iteration++
 
     // ── Drain steering buffer ───────────────────────────────────────────────
-    // If the user sent `/steer <msg>` or used the raptor.steer command while
-    // the agent was running, inject their guidance as a new User message so
-    // the LLM sees it on this iteration.
     const steered = drainSteering()
     if (steered.length > 0) {
       const combined = steered.join('\n\n')
-      messages.push(
-        vscode.LanguageModelChatMessage.User(
-          `[USER STEERING -- mid-session guidance, follow this immediately]\n${combined}`,
-        ),
-      )
+      messages.push({
+        role: 'user',
+        content: [{ type: 'text', value: `[USER STEERING -- mid-session guidance, follow this immediately]\n${combined}` }],
+      })
       stream.markdown(`\n> **Steering injected:** ${combined}\n\n`)
       logToOutput(`[steering] Injected ${steered.length} message(s): ${combined.slice(0, 200)}`)
     }
@@ -1909,7 +2205,7 @@ async function handleChatRequest(
     const tokenCount = estimateTokens(messages)
     if (tokenCount > FULL_COMPACT_THRESHOLD) {
       stream.progress(`Context full (${tokenCount.toLocaleString()} tokens) -- compacting...`)
-      const compacted = await fullCompactMessages(messages, model, token)
+      const compacted = await fullCompactMessages(messages, resolved, token)
       messages.length = 0
       messages.push(...compacted)
     } else if (tokenCount > MICRO_COMPACT_THRESHOLD) {
@@ -1918,24 +2214,27 @@ async function handleChatRequest(
       messages.push(...compacted)
     }
 
-    let response: vscode.LanguageModelChatResponse
+    let responseStream: AsyncIterable<RaptorResponseEvent>
     try {
-      response = await model.sendRequest(messages, { tools }, token)
+      responseStream = await resolved.provider.sendRequest(
+        resolved.model, messages, { tools }, token,
+      )
     } catch (err) {
-      stream.markdown(`\nModel error: ${String(err)}`)
+      const errMsg = err instanceof ProviderError ? err.message : String(err)
+      stream.markdown(`\nModel error: ${errMsg}`)
       return {}
     }
 
-    const textParts: vscode.LanguageModelTextPart[]     = []
-    const toolCalls: vscode.LanguageModelToolCallPart[] = []
+    const textParts: RaptorTextPart[] = []
+    const toolCalls: RaptorToolCallPart[] = []
 
-    for await (const part of response.stream) {
+    for await (const part of responseStream) {
       if (token.isCancellationRequested) break
-      if (part instanceof vscode.LanguageModelTextPart) {
-        textParts.push(part)
+      if (part.type === 'text') {
+        textParts.push({ type: 'text', value: part.value })
         stream.markdown(part.value)
-      } else if (part instanceof vscode.LanguageModelToolCallPart) {
-        toolCalls.push(part)
+      } else if (part.type === 'tool_call') {
+        toolCalls.push({ type: 'tool_call', callId: part.callId, name: part.name, input: part.input })
       }
     }
 
@@ -1944,41 +2243,20 @@ async function handleChatRequest(
     if (token.isCancellationRequested) break
     if (toolCalls.length === 0) break
 
-    messages.push(
-      new vscode.LanguageModelChatMessage(
-        vscode.LanguageModelChatMessageRole.Assistant,
-        [...textParts, ...toolCalls],
-      ),
-    )
+    appendToolResult(messages, textParts, toolCalls)
 
     totalToolCalls += toolCalls.length
 
     const callSummary = toolCalls.map(c => `${c.name}(${summariseInput(c.input)})`).join(', ')
     stream.progress(`[iter ${iteration}] ${callSummary}`)
 
-    const settled = await Promise.allSettled(
-      toolCalls.map(async toolCall => {
-        const input = toolCall.input as Record<string, unknown>
-        let result: string
-        try {
-          result = await dispatchTool(toolCall.name, input, token)
-        } catch (err) {
-          result = `Error: ${String(err)}`
-        }
-        return { toolCall, result }
-      }),
-    )
-
-    for (const outcome of settled) {
-      const { toolCall, result } = outcome.status === 'fulfilled'
-        ? outcome.value
-        : { toolCall: toolCalls[settled.indexOf(outcome)], result: `Error: ${String((outcome as PromiseRejectedResult).reason)}` }
-
+    const results = await executeToolCallsInOrder(toolCalls, token)
+    for (const { toolCall, result } of results) {
       if (toolCall.name === 'todoWrite') {
         const todos = (toolCall.input as ToolInput)['todos']
         if (Array.isArray(todos) && todos.length > 0) {
           const lines = todos.map((t: {id?:string;content?:string;status?:string}) => {
-            const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬜'
+            const icon = t.status === 'completed' ? '\u2705' : t.status === 'in_progress' ? '\ud83d\udd04' : '\u2b1c'
             return `${icon} ${t.content ?? t.id}`
           })
           stream.markdown(`\n**Tasks:**\n${lines.join('\n')}\n`)
@@ -1988,14 +2266,7 @@ async function handleChatRequest(
       renderToolResultDropdown(stream, toolCall, result)
       logToolCallToOutput(toolCall.name, toolCall.input as Record<string, unknown>, result)
 
-      messages.push(
-        new vscode.LanguageModelChatMessage(
-          vscode.LanguageModelChatMessageRole.User,
-          [new vscode.LanguageModelToolResultPart(toolCall.callId, [
-            new vscode.LanguageModelTextPart(result),
-          ])],
-        ),
-      )
+      appendToolResultToMessages(messages, toolCall.callId, result)
     }
   }
 
@@ -2008,7 +2279,7 @@ async function handleChatRequest(
 
   // ── Post-turn: save session summary + extract memories + save history (fire-and-forget) ──
   if (fullAssistantText.trim()) {
-    void generateSessionSummary(messages, model, token).then(summary => {
+    void generateSessionSummary(messages, resolved, token).then(summary => {
       if (summary) return saveSessionSummary(summary)
     })
     void extractAndStoreMemories(request.prompt, fullAssistantText)
@@ -2034,10 +2305,40 @@ async function handleChatRequest(
  */
 // ─── Messages ─────────────────────────────────────────────────────────────────
 
+function inferActiveAgent(chatContext: vscode.ChatContext): string {
+  // Walk history backwards to find the most recent agent switch marker
+  for (let i = chatContext.history.length - 1; i >= 0; i--) {
+    const turn = chatContext.history[i]
+    if (turn instanceof vscode.ChatResponseTurn) {
+      const meta = (turn.result as vscode.ChatResult | undefined)?.metadata
+      if (meta && typeof meta === 'object' && 'activeAgent' in meta) {
+        return String((meta as Record<string, unknown>).activeAgent)
+      }
+    }
+  }
+  return getActiveAgentId()
+}
+
+function inferActiveModel(chatContext: vscode.ChatContext): string | undefined {
+  for (let i = chatContext.history.length - 1; i >= 0; i--) {
+    const turn = chatContext.history[i]
+    if (turn instanceof vscode.ChatResponseTurn) {
+      const meta = (turn.result as vscode.ChatResult | undefined)?.metadata
+      if (meta && typeof meta === 'object' && 'activeModel' in meta) {
+        const value = (meta as Record<string, unknown>).activeModel
+        return typeof value === 'string' && value.trim() ? value : undefined
+      }
+    }
+  }
+  return getActiveModelSpec()
+}
+
 async function buildMessages(
   chatContext: vscode.ChatContext,
   request: vscode.ChatRequest,
-): Promise<vscode.LanguageModelChatMessage[]> {
+  activeAgent: Agent,
+  loaded: LoadedConfig,
+): Promise<RaptorMessage[]> {
   // Inject persistent memory (global + project) + workspace profile into system prompt
   const [globalMem, projectMem, wsProfile] = await Promise.all([
     readMemoryIndex(),
@@ -2057,6 +2358,18 @@ async function buildMessages(
     sections.push(`\n\n# Project Memory\nFacts specific to this workspace/project:\n\n${projectMem}`)
   }
 
+  // Agent prompt + skills
+  if (activeAgent.prompt?.trim()) {
+    sections.push(`\n\n# Agent Instructions\nYou are acting as the "${activeAgent.name ?? activeAgent.id}" agent.\n\n${activeAgent.prompt.trim()}`)
+  }
+  const skillIds = activeAgent.skills ?? []
+  if (skillIds.length > 0) {
+    const skillText = getSkillContent(loaded.skills, skillIds)
+    if (skillText.trim()) {
+      sections.push(`\n\n# Skills\n${skillText}`)
+    }
+  }
+
   const memorySection = sections.join('')
 
   const root = workspaceRoot() ?? '(no workspace)'
@@ -2065,34 +2378,34 @@ async function buildMessages(
     ? `Active file: ${promptEditor.document.fileName}  Language: ${promptEditor.document.languageId}`
     : 'No file open'
 
-  const messages: vscode.LanguageModelChatMessage[] = [
-    vscode.LanguageModelChatMessage.User(buildSystemPrompt({
-      root,
-      editorContext,
-      today: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
-      isWindows: process.platform === 'win32',
-      platform: process.platform,
-      shell: process.platform === 'win32'
-        ? 'cmd.exe (Windows). Use standard CMD syntax: && to chain, & for parallel, | for pipe. For PowerShell-specific commands, use: powershell -Command "..."'
-        : process.env.SHELL ?? 'unknown',
-      dataDir: raptorDataDir(),
-      tempDir: extensionTempDir(),
-    }) + memorySection),
-    vscode.LanguageModelChatMessage.Assistant(
-      'Ready. I will use my tools autonomously to complete your request without asking for permission.',
-    ),
+  const messages: RaptorMessage[] = [
+    {
+      role: 'system',
+      content: [{ type: 'text', value: buildSystemPrompt({
+        root,
+        editorContext,
+        today: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+        isWindows: process.platform === 'win32',
+        platform: process.platform,
+        shell: process.platform === 'win32'
+          ? 'cmd.exe (Windows). Use standard CMD syntax: && to chain, & for parallel, | for pipe. For PowerShell-specific commands, use: powershell -Command "..."'
+          : process.env.SHELL ?? 'unknown',
+        dataDir: raptorDataDir(),
+        tempDir: extensionTempDir(),
+      }) + memorySection }],
+    },
   ]
 
   for (const turn of chatContext.history) {
     if (turn instanceof vscode.ChatRequestTurn) {
-      messages.push(vscode.LanguageModelChatMessage.User(turn.prompt))
+      messages.push({ role: 'user', content: [{ type: 'text', value: turn.prompt }] })
     } else if (turn instanceof vscode.ChatResponseTurn) {
       const text = (turn.response as vscode.ChatResponsePart[])
         .filter((p): p is vscode.ChatResponseMarkdownPart =>
           p instanceof vscode.ChatResponseMarkdownPart)
         .map(p => p.value.value)
         .join('')
-      if (text) messages.push(vscode.LanguageModelChatMessage.Assistant(text))
+      if (text) messages.push({ role: 'assistant', content: [{ type: 'text', value: text }] })
     }
   }
 
@@ -2119,17 +2432,237 @@ async function buildMessages(
     }
   }
 
-  messages.push(vscode.LanguageModelChatMessage.User(userContent))
+  messages.push({ role: 'user', content: [{ type: 'text', value: userContent }] })
   return messages
 }
 
 // ─── Commands ──────────────────────────────────────────────────────────────────
+
+function injectBuildFlowCommand(messages: RaptorMessage[]): void {
+  const instruction = [
+    '',
+    '[COMMAND: /build-flow]',
+    'Follow the agent-flow-builder skill process now.',
+    'Start with Phase 1: read .raptor/agents.json and .raptor/flows.json using readFile; treat missing files as empty arrays.',
+    'Then continue to Phase 2 and interview the user in one message.',
+  ].join('\n')
+
+  const last = messages[messages.length - 1]
+  const textPart = last?.role === 'user'
+    ? last.content.find((part): part is RaptorTextPart => part.type === 'text')
+    : undefined
+
+  if (textPart) {
+    textPart.value = `${textPart.value.trimEnd()}\n\n${instruction}`
+    return
+  }
+
+  messages.push({ role: 'user', content: [{ type: 'text', value: instruction.trimStart() }] })
+}
 
 function registerCommands(context: vscode.ExtensionContext): void {
   registerCommandsModule(context, {
     workspaceRoot,
     pushSteering,
   })
+}
+
+// ─── Flow runner ───────────────────────────────────────────────────────────────
+
+const localModelQueue = new Map<string, Promise<unknown>>()
+
+async function acquireLocalModel(model: RaptorModel): Promise<() => void> {
+  const isLocal = model.providerId === 'ollama' || /local/i.test(model.id) || /local/i.test(model.name)
+  if (!isLocal) return () => {}
+
+  const key = model.id
+  const previous = localModelQueue.get(key) ?? Promise.resolve()
+  let release = () => {}
+  const next = new Promise<void>((resolve) => {
+    release = () => {
+      localModelQueue.delete(key)
+      resolve()
+    }
+  })
+  localModelQueue.set(key, previous.then(() => next))
+  await previous
+  return release
+}
+
+function normalizeModelToken(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+interface FlowRunOptions {
+  allowModelChanges?: boolean
+  keepCurrentModel?: boolean
+  currentModelSpec?: string
+}
+
+function flowStepModelSpec(step: Flow['steps'][number], loaded: LoadedConfig, currentModelSpec: string | undefined): string {
+  const agent = loaded.agents.get(step.agent) ?? loaded.agents.get('_default')
+  return step.model ?? agent?.model ?? currentModelSpec ?? getConfiguredFallbackModel()
+}
+
+function collectFlowModelChanges(flow: Flow, loaded: LoadedConfig, currentModelSpec: string | undefined): Array<{ step: number; agent: string; from: string; to: string }> {
+  const changes: Array<{ step: number; agent: string; from: string; to: string }> = []
+  let previous = currentModelSpec ?? getConfiguredFallbackModel()
+  for (let i = 0; i < flow.steps.length; i++) {
+    const step = flow.steps[i]
+    const next = flowStepModelSpec(step, loaded, currentModelSpec)
+    if (normalizeModelToken(next) !== normalizeModelToken(previous)) {
+      changes.push({ step: i + 1, agent: step.agent, from: previous, to: next })
+    }
+    previous = next
+  }
+  return changes
+}
+
+async function runFlow(
+  flow: Flow,
+  loaded: LoadedConfig,
+  request: vscode.ChatRequest,
+  chatContext: vscode.ChatContext,
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+  options: FlowRunOptions = {},
+): Promise<void> {
+  stream.markdown(`**Starting flow: ${flow.name ?? flow.id}** (${flow.steps.length} steps)\n\n`)
+  logToOutput(`[flow] Starting "${flow.id}" with ${flow.steps.length} steps`)
+
+  let stepSummary = ''
+
+  for (let i = 0; i < flow.steps.length; i++) {
+    if (token.isCancellationRequested) {
+      stream.markdown('\n_Flow cancelled by user._\n')
+      return
+    }
+
+    const step = flow.steps[i]
+    const agent = loaded.agents.get(step.agent) ?? loaded.agents.get('_default')!
+    const modelSpec = options.keepCurrentModel
+      ? options.currentModelSpec
+      : step.model ?? agent.model
+    const stepAgent: Agent = {
+      ...agent,
+      model: modelSpec,
+      skills: step.skills ?? agent.skills,
+      tools: step.tools ?? agent.tools,
+    }
+
+    stream.markdown(`**Step ${i + 1}/${flow.steps.length}** — ${agent.name ?? agent.id}\n`)
+    logToOutput(`[flow] Step ${i + 1}: agent=${step.agent}, model=${stepAgent.model ?? 'default'}`)
+
+    let resolved: ResolvedModel
+    try {
+      resolved = await getRegistry().resolve({
+        flowStepModel: modelSpec,
+        agentModel: options.keepCurrentModel ? undefined : agent.model,
+        fallbackModel: modelSpec ?? options.currentModelSpec ?? getConfiguredFallbackModel(),
+      })
+    } catch (err) {
+      stream.markdown(`\n❌ No model available for step ${i + 1}. Aborting flow.`)
+      return
+    }
+
+    const release = await acquireLocalModel(resolved.model)
+    try {
+      const messages = await buildMessages(chatContext, request, stepAgent, loaded)
+      // Replace the last user message with the step instruction + prior summary
+      const lastUser = messages[messages.length - 1]
+      if (lastUser && lastUser.role === 'user') {
+        const textParts = lastUser.content.filter((p): p is RaptorTextPart => p.type === 'text')
+        const originalPrompt = textParts.map(p => p.value).join('')
+        const budget = step.summaryBudget ?? 2000
+        const summaryPrefix = stepSummary
+          ? `[Previous steps summary (max ${budget} chars):\n${stepSummary.slice(0, budget)}\n]\n\n`
+          : ''
+        const newContent = `${summaryPrefix}${step.instruction}\n\n[Original user request context: ${originalPrompt}]`
+        messages[messages.length - 1] = { role: 'user', content: [{ type: 'text', value: newContent }] }
+      }
+
+      const allToolNames = getToolDefs().map(t => t.name)
+      const allowedToolNames = filterToolsByAgent(allToolNames, stepAgent.tools)
+      const requestedTools = getToolDefs().filter(t => allowedToolNames.includes(t.name))
+      const tools = resolved.provider.supportsTools(resolved.model) ? requestedTools : []
+
+      let stepText = ''
+      let iteration = 0
+      let stepToolCalls = 0
+      const maxIterations = getConfig().maxIterations
+
+      const capNote = tools.length === 0 ? ' (text-only)' : ''
+      stream.progress(`raptor -> ${resolved.model.name} (${resolved.source}; step ${i + 1}${capNote})`)
+      stream.markdown(`\n> **Step ${i + 1} model:** \`${resolved.provider.id}:${resolved.model.id}\` (${resolved.source})\n\n`)
+
+      while (iteration < maxIterations) {
+        if (token.isCancellationRequested) break
+        iteration++
+
+        const tokenCount = estimateTokens(messages)
+        if (tokenCount > FULL_COMPACT_THRESHOLD) {
+          stream.progress(`Flow step ${i + 1} context full (${tokenCount.toLocaleString()} tokens) -- compacting...`)
+          const compacted = await fullCompactMessages(messages, resolved, token)
+          messages.length = 0
+          messages.push(...compacted)
+        } else if (tokenCount > MICRO_COMPACT_THRESHOLD) {
+          const compacted = microCompactMessages(messages)
+          messages.length = 0
+          messages.push(...compacted)
+        }
+
+        const responseStream = await resolved.provider.sendRequest(resolved.model, messages, { tools }, token)
+        const textParts: RaptorTextPart[] = []
+        const toolCalls: RaptorToolCallPart[] = []
+
+        for await (const part of responseStream) {
+          if (token.isCancellationRequested) break
+          if (part.type === 'text') {
+            textParts.push({ type: 'text', value: part.value })
+            stepText += part.value
+            stream.markdown(part.value)
+          } else if (part.type === 'tool_call') {
+            toolCalls.push({ type: 'tool_call', callId: part.callId, name: part.name, input: part.input })
+          }
+        }
+
+        if (token.isCancellationRequested) break
+        if (toolCalls.length === 0) break
+
+        appendToolResult(messages, textParts, toolCalls)
+
+        stepToolCalls += toolCalls.length
+        const callSummary = toolCalls.map(c => `${c.name}(${summariseInput(c.input)})`).join(', ')
+        stream.progress(`[flow step ${i + 1} iter ${iteration}] ${callSummary}`)
+
+        const results = await executeToolCallsInOrder(toolCalls, token)
+        for (const { toolCall, result } of results) {
+          renderToolResultDropdown(stream, toolCall, result)
+          logToolCallToOutput(toolCall.name, toolCall.input as Record<string, unknown>, result)
+
+          appendToolResultToMessages(messages, toolCall.callId, result)
+        }
+      }
+
+      if (iteration >= maxIterations) {
+        stream.markdown(`\n\nStep ${i + 1} reached maximum iterations (${maxIterations}). Task may be incomplete.`)
+      }
+
+      // Compact step output for next step summary
+      const compact = stepText.trim().slice(0, step.summaryBudget ?? 2000)
+      stepSummary += `\n--- Step ${i + 1} (${agent.name ?? agent.id}) ---\n${compact}\n`
+      logToOutput(`[flow] Step ${i + 1} completed (${stepText.length} chars, ${stepToolCalls} tool calls)`)
+    } catch (err) {
+      stream.markdown(`\n❌ Step ${i + 1} failed: ${String(err)}. Flow aborted.`)
+      logToOutput(`[flow] Step ${i + 1} error: ${String(err)}`)
+      return
+    } finally {
+      release()
+    }
+  }
+
+  stream.markdown(`\n✅ Flow **${flow.name ?? flow.id}** completed.`)
+  logToOutput(`[flow] "${flow.id}" completed`)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────

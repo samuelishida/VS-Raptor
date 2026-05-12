@@ -39,5 +39,31 @@ export function registerCommands(
         vscode.window.showInformationMessage(`raptor: steering queued -- "${trimmed.slice(0, 60)}"`)
       }
     }),
+
+    vscode.commands.registerCommand('raptor.setProviderApiKey', async () => {
+      const providerId = await vscode.window.showInputBox({
+        prompt: 'Provider ID (e.g. anthropic, openai, openrouter)',
+        placeHolder: 'anthropic',
+      })
+      if (!providerId?.trim()) return
+      const key = await vscode.window.showInputBox({
+        prompt: `API Key for ${providerId.trim()}`,
+        password: true,
+        placeHolder: 'sk-...',
+      })
+      if (!key?.trim()) return
+      await context.secrets.store(`raptor-provider-${providerId.trim()}-apiKey`, key.trim())
+      vscode.window.showInformationMessage(`raptor: API key stored for "${providerId.trim()}"`)
+    }),
+
+    vscode.commands.registerCommand('raptor.clearProviderApiKey', async () => {
+      const providerId = await vscode.window.showInputBox({
+        prompt: 'Provider ID to clear API key for (e.g. anthropic, openai)',
+        placeHolder: 'anthropic',
+      })
+      if (!providerId?.trim()) return
+      await context.secrets.delete(`raptor-provider-${providerId.trim()}-apiKey`)
+      vscode.window.showInformationMessage(`raptor: API key cleared for "${providerId.trim()}"`)
+    }),
   )
 }

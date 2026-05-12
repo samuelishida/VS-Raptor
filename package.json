@@ -1,9 +1,17 @@
 {
-	"name": "raptor-vscode-extension",
+	"name": "raptor",
 	"displayName": "raptor",
 	"version": "0.2.0",
-	"description": "VS Raptor Extension",
-	"license": "UNLICENSED",
+	"description": "Agent orchestrator — routes tasks to specialist skills and builds custom agent flows. Works as a VS Code extension, Claude Code plugin, and npm-installable skill pack.",
+	"license": "MIT",
+	"files": [
+		".codex-plugin/",
+		".claude-plugin/",
+		"skills/",
+		"agents/",
+		"plugin.json",
+		"README.md"
+	],
 	"categories": [
 		"Other",
 		"AI"
@@ -27,7 +35,9 @@
 		"onChatParticipant:raptor.agent",
 		"onCommand:raptor.openPanel",
 		"onCommand:raptor.runInTerminal",
-		"onCommand:raptor.steer"
+		"onCommand:raptor.steer",
+		"onCommand:raptor.setProviderApiKey",
+		"onCommand:raptor.clearProviderApiKey"
 	],
 	"contributes": {
 		"commands": [
@@ -42,6 +52,14 @@
 			{
 				"command": "raptor.steer",
 				"title": "raptor: Steer Running Agent"
+			},
+			{
+				"command": "raptor.setProviderApiKey",
+				"title": "raptor: Set Provider API Key (SecretStorage)"
+			},
+			{
+				"command": "raptor.clearProviderApiKey",
+				"title": "raptor: Clear Provider API Key"
 			}
 		],
 		"chatParticipants": [
@@ -49,7 +67,7 @@
 				"id": "raptor.agent",
 				"name": "raptor",
 				"fullName": "raptor Agent",
-				"description": "Autonomous coding assistant with file, terminal, and memory tools.",
+				"description": "Agent orchestrator — routes tasks to specialist skills, builds agent flows, and runs multi-step automations.",
 				"isSticky": true,
 				"commands": [
 					{
@@ -75,7 +93,31 @@
 					{
 						"name": "steer",
 						"description": "Inject guidance into a running session"
-					}
+					},
+					{
+						"name": "agents",
+						"description": "List loaded agents"
+					},
+					{
+						"name": "agent",
+						"description": "Switch to a specific agent"
+					},
+				{
+					"name": "flows",
+					"description": "List loaded flows"
+				},
+				{
+					"name": "flow",
+					"description": "Run a specific flow"
+				},
+				{
+					"name": "models",
+					"description": "List available providers and models"
+				},
+				{
+					"name": "build-flow",
+					"description": "Design and build an agent flow for this project"
+				}
 				]
 			}
 		],
@@ -98,6 +140,67 @@
 					"type": "string",
 					"default": "claude-sonnet-4.6",
 					"description": "Preferred fallback model when no session-selected model is available."
+				},
+				"raptor.defaultProvider": {
+					"type": "string",
+					"default": "vscode",
+					"enum": ["vscode", "anthropic", "openai", "openrouter", "ollama", "claude-code", "codex", "opencode"],
+					"description": "Default provider to use when no model is specified."
+				},
+				"raptor.providers.enabled": {
+					"type": "object",
+					"default": { "anthropic": false, "openai": false, "openrouter": false, "ollama": true, "claude-code": false, "codex": false, "opencode": false },
+					"description": "Enable/disable individual providers."
+				},
+				"raptor.provider.claude-code.command": {
+					"type": "string",
+					"default": "claude",
+					"description": "Path or command to Claude Code CLI."
+				},
+				"raptor.provider.claude-code.defaultModel": {
+					"type": "string",
+					"default": "sonnet",
+					"description": "Default model for Claude Code CLI."
+				},
+				"raptor.provider.codex.command": {
+					"type": "string",
+					"default": "codex",
+					"description": "Path or command to Codex CLI."
+				},
+				"raptor.provider.codex.defaultModel": {
+					"type": "string",
+					"default": "gpt-5.3-codex",
+					"description": "Default model for Codex CLI."
+				},
+				"raptor.provider.opencode.command": {
+					"type": "string",
+					"default": "opencode",
+					"description": "Path or command to OpenCode CLI."
+				},
+				"raptor.provider.opencode.defaultModel": {
+					"type": "string",
+					"default": "default",
+					"description": "Default model for OpenCode CLI."
+				},
+				"raptor.provider.anthropic.apiKey": {
+					"type": "string",
+					"default": "",
+					"description": "[Deprecated] Anthropic API key. Use VS Code SecretStorage (command: raptor.setProviderApiKey) instead."
+				},
+				"raptor.provider.openai.apiKey": {
+					"type": "string",
+					"default": "",
+					"description": "[Deprecated] OpenAI API key. Use VS Code SecretStorage (command: raptor.setProviderApiKey) instead."
+				},
+				"raptor.provider.openrouter.apiKey": {
+					"type": "string",
+					"default": "",
+					"description": "[Deprecated] OpenRouter API key. Use VS Code SecretStorage (command: raptor.setProviderApiKey) instead."
+				},
+				"raptor.provider.ollama.baseUrl": {
+					"type": "string",
+					"default": "http://localhost:11434",
+					"description": "Ollama server base URL."
 				}
 			}
 		}
