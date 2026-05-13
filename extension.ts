@@ -35,7 +35,7 @@ import {
   createProviderRegistry,
   type ProviderRegistry,
 } from './src/providers/registry'
-import { createVSCodeProvider } from './src/providers/vscode'
+import { createVSCodeProvider, setVSCodeSessionModel } from './src/providers/vscode'
 import { createAnthropicProvider } from './src/providers/anthropic'
 import { createOpenAIProvider } from './src/providers/openai'
 import { createOpenRouterProvider } from './src/providers/openrouter'
@@ -1920,6 +1920,11 @@ async function handleChatRequest(
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<vscode.ChatResult> {
+  // Pin request.model so the vscode provider uses it directly in sendRequest.
+  // Copilot only allows request.model to produce responses in a handler invocation;
+  // models found via selectChatModels() silently return 0 chars.
+  setVSCodeSessionModel(request.model)
+
   const config = getConfig()
   const promptTrimmed = request.prompt.trim()
 
@@ -2115,8 +2120,9 @@ async function handleChatRequest(
     const flowId = flowParts[0] ?? ''
     const allowModelChanges = flowParts.includes('--accept-models')
     const keepCurrentModel = flowParts.includes('--keep-current')
+    const autopilot = flowParts.includes('--autopilot')
     if (!flowId) {
-      stream.markdown('Usage: `/flow <id>` -- run a loaded flow. Use `/flows` to list.')
+      stream.markdown('Usage: `/flow <id> [--autopilot]` -- run a loaded flow. Use `/flows` to list.')
       return {}
     }
     const flow = loaded.flows.get(flowId)
@@ -2126,23 +2132,27 @@ async function handleChatRequest(
     }
     const currentAgent = loaded.agents.get(inferActiveAgent(chatContext)) ?? loaded.agents.get('_default')!
     const currentModelSpec = currentAgent.model ?? inferActiveModel(chatContext) ?? getConfiguredFallbackModel()
-    const modelChanges = collectFlowModelChanges(flow, loaded, currentModelSpec)
-    if (modelChanges.length > 0 && !allowModelChanges && !keepCurrentModel) {
-      const rows = modelChanges.map(change =>
-        `| ${change.step} | \`${change.agent}\` | \`${change.from}\` | \`${change.to}\` |`
-      )
-      stream.markdown([
-        `Flow **${flow.name ?? flow.id}** wants to change models between steps.`,
-        '',
-        '| Step | Agent | Current/Previous | Requested |',
-        '|---|---|---|---|',
-        ...rows,
-        '',
-        `Reply with \`/flow ${flow.id} --accept-models\` to use the flow's configured models, or \`/flow ${flow.id} --keep-current\` to run every step with \`${currentModelSpec}\`.`,
-      ].join('\n'))
-      return {}
+    // Skip the model-change gate — flow steps use configured providers, not the VS Code chat UI model.
+    if (!allowModelChanges && !keepCurrentModel) {
+      const modelChanges = collectFlowModelChanges(flow, loaded, currentModelSpec)
+      if (modelChanges.length > 0) {
+        const rows = modelChanges.map(change =>
+          `| ${change.step} | \`${change.agent}\` | \`${change.from}\` | \`${change.to}\` |`
+        )
+        stream.markdown([
+          `Flow **${flow.name ?? flow.id}** wants to change models between steps.`,
+          '',
+          '| Step | Agent | Current/Previous | Requested |',
+          '|---|---|---|---|',
+          ...rows,
+          '',
+          `Reply with \`/flow ${flow.id} --accept-models\` to use the flow's configured models, or \`/flow ${flow.id} --keep-current\` to run every step with \`${currentModelSpec}\`.`,
+          `Add \`--autopilot\` to skip between-step confirmations.`,
+        ].join('\n'))
+        return {}
+      }
     }
-    await runFlow(flow, loaded, request, chatContext, stream, token, { allowModelChanges, keepCurrentModel, currentModelSpec })
+    await runFlow(flow, loaded, request, chatContext, stream, token, { allowModelChanges, keepCurrentModel, currentModelSpec, autopilot })
     return {}
   }
 
@@ -2157,7 +2167,8 @@ async function handleChatRequest(
   try {
     resolved = await getRegistry().resolve({
       agentModel: requestedModelSpec,
-      fallbackModel: requestedModelSpec ?? getConfiguredFallbackModel(),
+      sessionModel: request.model ? { providerId: 'vscode', modelId: request.model.id } : undefined,
+      fallbackModel: getConfiguredFallbackModel(),
     })
   } catch (err) {
     const errMsg = err instanceof ProviderError ? err.message : String(err)
@@ -2178,7 +2189,6 @@ async function handleChatRequest(
   const availabilityNote = `${resolved.available.length} model${resolved.available.length === 1 ? '' : 's'} detected`
   const capNote = tools.length === 0 ? ' (text-only provider)' : ''
   stream.progress(`raptor -> ${resolved.model.name} (${resolved.source}; ${availabilityNote}${capNote})`)
-  stream.markdown(`> **Model:** \`${resolved.provider.id}:${resolved.model.id}\` (${resolved.source})\n\n`)
 
   const MAX_ITERATIONS = config.maxIterations
   let iteration = 0
@@ -2497,6 +2507,7 @@ interface FlowRunOptions {
   allowModelChanges?: boolean
   keepCurrentModel?: boolean
   currentModelSpec?: string
+  autopilot?: boolean
 }
 
 function flowStepModelSpec(step: Flow['steps'][number], loaded: LoadedConfig, currentModelSpec: string | undefined): string {
@@ -2550,20 +2561,34 @@ async function runFlow(
       tools: step.tools ?? agent.tools,
     }
 
-    stream.markdown(`**Step ${i + 1}/${flow.steps.length}** — ${agent.name ?? agent.id}\n`)
-    logToOutput(`[flow] Step ${i + 1}: agent=${step.agent}, model=${stepAgent.model ?? 'default'}`)
-
     let resolved: ResolvedModel
     try {
       resolved = await getRegistry().resolve({
-        flowStepModel: modelSpec,
+        flowStepModel: options.keepCurrentModel ? undefined : modelSpec,
         agentModel: options.keepCurrentModel ? undefined : agent.model,
-        fallbackModel: modelSpec ?? options.currentModelSpec ?? getConfiguredFallbackModel(),
+        sessionModel: request.model ? { providerId: 'vscode', modelId: request.model.id } : undefined,
+        fallbackModel: getConfiguredFallbackModel(),
       })
     } catch (err) {
-      stream.markdown(`\n❌ No model available for step ${i + 1}. Aborting flow.`)
+      stream.markdown(`\n❌ Step ${i + 1} (${agent.name ?? agent.id}): no model available.\n\nConfigured model: \`${modelSpec ?? 'none'}\`. Enable a provider (Anthropic, Ollama, OpenRouter) or remove the model spec from the agent/step.\n\n> Check raptor Settings → \`raptor.providers.enabled\``)
       return
     }
+
+    // Warn if the configured model didn't match — something else was used instead.
+    const requestedNorm = modelSpec?.toLowerCase().trim() ?? ''
+    const resolvedId = resolved.model.id.toLowerCase().trim()
+    const resolvedName = resolved.model.name.toLowerCase().trim()
+    const modelMismatch = requestedNorm
+      && resolved.source !== 'fallback'
+      && !resolvedId.includes(requestedNorm)
+      && !resolvedName.includes(requestedNorm)
+      && !requestedNorm.includes(resolvedId)
+
+    stream.markdown(`**Step ${i + 1}/${flow.steps.length}** — ${agent.name ?? agent.id} \`${resolved.provider.id}:${resolved.model.id}\`\n`)
+    if (modelMismatch) {
+      stream.markdown(`> ⚠️ Configured model \`${modelSpec}\` not found — using \`${resolved.provider.id}:${resolved.model.id}\` (${resolved.source}). Check provider is enabled.\n\n`)
+    }
+    logToOutput(`[flow] Step ${i + 1}: agent=${step.agent}, requested=${modelSpec ?? 'default'}, resolved=${resolved.provider.id}:${resolved.model.id} (${resolved.source})`)
 
     const release = await acquireLocalModel(resolved.model)
     try {
@@ -2593,7 +2618,6 @@ async function runFlow(
 
       const capNote = tools.length === 0 ? ' (text-only)' : ''
       stream.progress(`raptor -> ${resolved.model.name} (${resolved.source}; step ${i + 1}${capNote})`)
-      stream.markdown(`\n> **Step ${i + 1} model:** \`${resolved.provider.id}:${resolved.model.id}\` (${resolved.source})\n\n`)
 
       while (iteration < maxIterations) {
         if (token.isCancellationRequested) break
@@ -2648,10 +2672,28 @@ async function runFlow(
         stream.markdown(`\n\nStep ${i + 1} reached maximum iterations (${maxIterations}). Task may be incomplete.`)
       }
 
+      if (!stepText.trim() && stepToolCalls === 0) {
+        stream.markdown(`\n⚠️ Step ${i + 1} produced no output. Check the raptor Output channel for details. Continuing...`)
+      }
+
       // Compact step output for next step summary
       const compact = stepText.trim().slice(0, step.summaryBudget ?? 2000)
       stepSummary += `\n--- Step ${i + 1} (${agent.name ?? agent.id}) ---\n${compact}\n`
       logToOutput(`[flow] Step ${i + 1} completed (${stepText.length} chars, ${stepToolCalls} tool calls)`)
+
+      // Between-step confirmation (skip on last step and when autopilot is on)
+      const isLastStep = i === flow.steps.length - 1
+      if (!isLastStep && !options.autopilot) {
+        const choice = await vscode.window.showInformationMessage(
+          `Step ${i + 1}/${flow.steps.length} complete. Continue to step ${i + 2}?`,
+          'Continue',
+          'Stop',
+        )
+        if (choice !== 'Continue') {
+          stream.markdown(`\nFlow stopped after step ${i + 1}.`)
+          return
+        }
+      }
     } catch (err) {
       stream.markdown(`\n❌ Step ${i + 1} failed: ${String(err)}. Flow aborted.`)
       logToOutput(`[flow] Step ${i + 1} error: ${String(err)}`)

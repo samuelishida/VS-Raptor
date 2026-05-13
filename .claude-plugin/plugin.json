@@ -1,0 +1,10 @@
+{
+  "name": "raptor",
+  "version": "0.2.0",
+  "description": "Agent orchestrator with specialist skills for coding workflows, code review, planning, refactoring, and agent-flow design.",
+  "keywords": ["coding", "agent", "orchestrator", "workflow", "audit", "review", "planning"],
+  "skills": "./skills",
+  "author": {
+    "name": "Samuel Ishida"
+  }
+}

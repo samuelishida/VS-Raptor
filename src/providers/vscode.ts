@@ -7,6 +7,16 @@ import {
   type RaptorResponseEvent,
 } from './types'
 
+// Copilot LM API only allows request.model to produce responses within a handler
+// invocation. Models found via selectChatModels() lack the invocation's permission
+// context and silently return 0 chars. Store the handler's model here so sendRequest
+// can always use it instead of relying on a by-ID lookup.
+let activeSessionModel: vscode.LanguageModelChat | undefined
+
+export function setVSCodeSessionModel(model: vscode.LanguageModelChat | undefined): void {
+  activeSessionModel = model
+}
+
 export function createVSCodeProvider(): ModelProvider {
   return {
     id: 'vscode',
@@ -29,9 +39,13 @@ export function createVSCodeProvider(): ModelProvider {
       options: { tools?: vscode.LanguageModelChatTool[] },
       token: vscode.CancellationToken,
     ): Promise<AsyncIterable<RaptorResponseEvent>> {
-      // Find the actual VS Code model object
-      const vscodeModels = await vscode.lm.selectChatModels()
-      const vscodeModel = vscodeModels.find(m => m.id === model.id)
+      // Prefer the stored session model (request.model from the active handler).
+      // Fall back to ID lookup only when no session model is set.
+      let vscodeModel: vscode.LanguageModelChat | undefined = activeSessionModel
+      if (!vscodeModel) {
+        const vscodeModels = await vscode.lm.selectChatModels()
+        vscodeModel = vscodeModels.find(m => m.id === model.id)
+      }
       if (!vscodeModel) {
         throw new ProviderError('vscode', 'model-not-found', `VS Code model "${model.id}" is no longer available.`)
       }

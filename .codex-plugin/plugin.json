@@ -1,0 +1,25 @@
+{
+  "name": "raptor",
+  "version": "0.2.0",
+  "description": "Agent orchestrator with specialist skills for coding workflows, code review, planning, refactoring, and agent-flow design.",
+  "author": {
+    "name": "Samuel Ishida"
+  },
+  "license": "MIT",
+  "keywords": ["coding", "agent", "orchestrator", "workflow", "audit", "review", "planning"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Raptor",
+    "shortDescription": "Route coding work through specialist skills and build agent flows.",
+    "longDescription": "Raptor provides an orchestration skill, coding workflow skills, review and planning specialists, and an agent-flow builder for custom automations.",
+    "developerName": "Samuel Ishida",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Route this coding task through the right skill.",
+      "Build a Raptor agent flow for this project.",
+      "Review this change and find runtime risks."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

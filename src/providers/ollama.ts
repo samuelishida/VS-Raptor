@@ -17,7 +17,7 @@ export function createOllamaProvider(config: OllamaConfig): ModelProvider {
   return {
     id: 'ollama',
     name: 'Ollama',
-    capability: 'native-text' as const,
+    capability: 'native-tools' as const,
     acceptsArbitraryModel: false,
 
     async listModels(): Promise<RaptorModel[]> {
@@ -42,7 +42,7 @@ export function createOllamaProvider(config: OllamaConfig): ModelProvider {
       token: vscode.CancellationToken,
     ): Promise<AsyncIterable<RaptorResponseEvent>> {
       const url = `${baseUrl}/api/chat`
-      const body = buildRequestBody(model, messages)
+      const body = buildRequestBody(model, messages, options.tools)
 
       const controller = new AbortController()
       token.onCancellationRequested(() => controller.abort())
@@ -62,38 +62,95 @@ export function createOllamaProvider(config: OllamaConfig): ModelProvider {
       return streamResponse(response.body)
     },
 
-    supportsTools() { return false }, // Ollama tool support varies by model
+    supportsTools() { return true },
   }
+}
+
+interface OllamaMessage {
+  role: string
+  content: string
+  tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }>
 }
 
 function buildRequestBody(
   model: RaptorModel,
   messages: RaptorMessage[],
+  tools?: vscode.LanguageModelChatTool[],
 ): Record<string, unknown> {
-  const ollamaMessages = messages.map(m => {
-    // Ollama expects system as first message
+  const ollamaMessages: OllamaMessage[] = []
+
+  for (const m of messages) {
     if (m.role === 'system') {
-      return {
+      ollamaMessages.push({
         role: 'system',
         content: m.content.filter(c => c.type === 'text').map(c => c.value).join(''),
-      }
+      })
+      continue
     }
-    return {
-      role: m.role,
-      content: m.content.map(c => {
-        if (c.type === 'text') return c.value
-        if (c.type === 'tool_call') return `[tool_call: ${c.name}]`
-        if (c.type === 'tool_result') return c.content.map(tc => tc.value).join('')
-        return ''
-      }).join(''),
-    }
-  })
 
-  return {
+    const toolResultParts = m.content.filter(c => c.type === 'tool_result')
+    const toolCallParts = m.content.filter(c => c.type === 'tool_call')
+    const textParts = m.content.filter(c => c.type === 'text')
+
+    // Tool results become role: 'tool' messages (one per result)
+    if (toolResultParts.length > 0) {
+      for (const tr of toolResultParts) {
+        if (tr.type !== 'tool_result') continue
+        ollamaMessages.push({
+          role: 'tool',
+          content: tr.content.map(c => c.value).join(''),
+        })
+      }
+      continue
+    }
+
+    // Assistant messages with tool calls
+    if (m.role === 'assistant' && toolCallParts.length > 0) {
+      ollamaMessages.push({
+        role: 'assistant',
+        content: textParts.map(c => c.value).join(''),
+        tool_calls: toolCallParts
+          .filter((c): c is Extract<typeof c, { type: 'tool_call' }> => c.type === 'tool_call')
+          .map(c => ({
+            function: { name: c.name, arguments: c.input },
+          })),
+      })
+      continue
+    }
+
+    // Normal user/assistant text messages
+    ollamaMessages.push({
+      role: m.role,
+      content: textParts.map(c => c.value).join(''),
+    })
+  }
+
+  const body: Record<string, unknown> = {
     model: model.id,
     messages: ollamaMessages,
     stream: true,
   }
+
+  if (tools && tools.length > 0) {
+    body.tools = tools.map(t => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.inputSchema,
+      },
+    }))
+  }
+
+  return body
+}
+
+interface OllamaChunk {
+  message?: {
+    content?: string
+    tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }>
+  }
+  done?: boolean
 }
 
 async function* streamResponse(body: ReadableStream<Uint8Array> | null): AsyncIterable<RaptorResponseEvent> {
@@ -102,6 +159,7 @@ async function* streamResponse(body: ReadableStream<Uint8Array> | null): AsyncIt
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
+  let tcCounter = 0
 
   while (true) {
     const { done, value } = await reader.read()
@@ -114,9 +172,22 @@ async function* streamResponse(body: ReadableStream<Uint8Array> | null): AsyncIt
     for (const line of lines) {
       if (!line.trim()) continue
       try {
-        const chunk = JSON.parse(line)
+        const chunk = JSON.parse(line) as OllamaChunk
         if (chunk.message?.content) {
           yield { type: 'text', value: chunk.message.content }
+        }
+        // Ollama only sends tool_calls in the final done:true chunk
+        if (chunk.done && chunk.message?.tool_calls) {
+          for (const tc of chunk.message.tool_calls) {
+            const name = tc.function?.name
+            if (!name) continue
+            yield {
+              type: 'tool_call',
+              callId: `ollama_tc_${tcCounter++}`,
+              name,
+              input: tc.function?.arguments ?? {},
+            }
+          }
         }
       } catch { /* ignore parse errors */ }
     }
