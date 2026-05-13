@@ -8,6 +8,7 @@
   "license": "MIT",
   "keywords": ["coding", "agent", "orchestrator", "workflow", "audit", "review", "planning"],
   "skills": "./skills/",
+  "agents": "./agents/",
   "interface": {
     "displayName": "Raptor",
     "shortDescription": "Route coding work through specialist skills and build agent flows.",

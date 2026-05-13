@@ -2120,11 +2120,57 @@ async function handleChatRequest(
     const flowId = flowParts[0] ?? ''
     const allowModelChanges = flowParts.includes('--accept-models')
     const keepCurrentModel = flowParts.includes('--keep-current')
-    const autopilot = flowParts.includes('--autopilot')
-    if (!flowId) {
-      stream.markdown('Usage: `/flow <id> [--autopilot]` -- run a loaded flow. Use `/flows` to list.')
+    const doResume = flowParts.includes('--resume')
+    const doMemory = flowParts.includes('--memory')
+
+    // /flow --list — show all saved flow states
+    if (flowId === '--list') {
+      const states = await listFlowStates()
+      if (states.length === 0) {
+        stream.markdown('No saved flow states. States are saved automatically when a flow is interrupted.')
+      } else {
+        const rows = states.map(s =>
+          `| \`${s.flowId}\` | ${s.completedSteps} steps done | ${new Date(s.updatedAt).toLocaleString()} |`
+        )
+        stream.markdown([
+          '## Saved flow states',
+          '',
+          '| Flow | Progress | Last updated |',
+          '|---|---|---|',
+          ...rows,
+          '',
+          'Resume with `/flow <id> --resume`. View summary with `/flow <id> --memory`.',
+        ].join('\n'))
+      }
       return {}
     }
+
+    if (!flowId) {
+      stream.markdown('Usage: `/flow <id> [--resume] [--accept-models] [--keep-current]` — run a flow. `/flow --list` lists saved states. `/flow <id> --memory` shows a flow\'s saved summary.')
+      return {}
+    }
+
+    // /flow <id> --memory — show persisted summary for this flow
+    if (doMemory) {
+      const saved = await loadFlowState(flowId)
+      if (!saved) {
+        stream.markdown(`No saved state for flow \`${flowId}\`.`)
+      } else {
+        stream.markdown([
+          `## Flow memory: \`${saved.flowId}\``,
+          '',
+          `**Progress:** ${saved.completedSteps} steps completed`,
+          `**Started:** ${new Date(saved.startedAt).toLocaleString()}`,
+          `**Updated:** ${new Date(saved.updatedAt).toLocaleString()}`,
+          '',
+          '### Step summaries',
+          '',
+          saved.stepSummary || '_(no summary)_',
+        ].join('\n'))
+      }
+      return {}
+    }
+
     const flow = loaded.flows.get(flowId)
     if (!flow) {
       stream.markdown(`Flow "${flowId}" not found. Use \`/flows\` to list available flows.`)
@@ -2147,12 +2193,23 @@ async function handleChatRequest(
           ...rows,
           '',
           `Reply with \`/flow ${flow.id} --accept-models\` to use the flow's configured models, or \`/flow ${flow.id} --keep-current\` to run every step with \`${currentModelSpec}\`.`,
-          `Add \`--autopilot\` to skip between-step confirmations.`,
         ].join('\n'))
         return {}
       }
     }
-    await runFlow(flow, loaded, request, chatContext, stream, token, { allowModelChanges, keepCurrentModel, currentModelSpec, autopilot })
+    let resumeFromStep: number | undefined
+    let resumedSummary: string | undefined
+    if (doResume) {
+      const saved = await loadFlowState(flow.id)
+      if (saved) {
+        resumeFromStep = saved.completedSteps
+        resumedSummary = saved.stepSummary
+        stream.markdown(`> ↩ Resuming **${flow.name ?? flow.id}** from step ${resumeFromStep + 1} (${flow.steps.length - resumeFromStep} remaining)\n\n`)
+      } else {
+        stream.markdown(`> No saved state for flow "${flow.id}" — starting fresh.\n\n`)
+      }
+    }
+    await runFlow(flow, loaded, request, chatContext, stream, token, { allowModelChanges, keepCurrentModel, currentModelSpec, resumeFromStep, resumedSummary })
     return {}
   }
 
@@ -2503,11 +2560,65 @@ function normalizeModelToken(value: string): string {
   return value.trim().toLowerCase()
 }
 
+// ─── Flow state persistence ────────────────────────────────────────────────────
+
+interface FlowState {
+  flowId: string
+  completedSteps: number
+  stepSummary: string
+  startedAt: string
+  updatedAt: string
+}
+
+function flowStateDir(): string {
+  const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  const base = ws ? path.join(ws, '.raptor') : raptorDataDir()
+  return path.join(base, 'flow-state')
+}
+
+function flowStatePath(flowId: string): string {
+  return path.join(flowStateDir(), `${flowId}.json`)
+}
+
+async function saveFlowState(state: FlowState): Promise<void> {
+  try {
+    await fs.mkdir(flowStateDir(), { recursive: true })
+    await fs.writeFile(flowStatePath(state.flowId), JSON.stringify(state, null, 2), 'utf-8')
+  } catch { /* non-fatal */ }
+}
+
+async function loadFlowState(flowId: string): Promise<FlowState | null> {
+  try {
+    const raw = await fs.readFile(flowStatePath(flowId), 'utf-8')
+    return JSON.parse(raw) as FlowState
+  } catch { return null }
+}
+
+async function deleteFlowState(flowId: string): Promise<void> {
+  try { await fs.unlink(flowStatePath(flowId)) } catch { /* already gone */ }
+}
+
+async function listFlowStates(): Promise<FlowState[]> {
+  try {
+    const dir = flowStateDir()
+    const files = (await fs.readdir(dir)).filter(f => f.endsWith('.json'))
+    const states: FlowState[] = []
+    for (const f of files) {
+      try {
+        const raw = await fs.readFile(path.join(dir, f), 'utf-8')
+        states.push(JSON.parse(raw) as FlowState)
+      } catch { /* skip malformed */ }
+    }
+    return states
+  } catch { return [] }
+}
+
 interface FlowRunOptions {
   allowModelChanges?: boolean
   keepCurrentModel?: boolean
   currentModelSpec?: string
-  autopilot?: boolean
+  resumeFromStep?: number
+  resumedSummary?: string
 }
 
 function flowStepModelSpec(step: Flow['steps'][number], loaded: LoadedConfig, currentModelSpec: string | undefined): string {
@@ -2538,15 +2649,29 @@ async function runFlow(
   token: vscode.CancellationToken,
   options: FlowRunOptions = {},
 ): Promise<void> {
-  stream.markdown(`**Starting flow: ${flow.name ?? flow.id}** (${flow.steps.length} steps)\n\n`)
-  logToOutput(`[flow] Starting "${flow.id}" with ${flow.steps.length} steps`)
+  const startedAt = new Date().toISOString()
+  const resumeFrom = options.resumeFromStep ?? 0
 
-  let stepSummary = ''
+  if (resumeFrom === 0) {
+    stream.markdown(`**Starting flow: ${flow.name ?? flow.id}** (${flow.steps.length} steps)\n\n`)
+    logToOutput(`[flow] Starting "${flow.id}" with ${flow.steps.length} steps`)
+  } else {
+    stream.markdown(`**Resuming flow: ${flow.name ?? flow.id}** from step ${resumeFrom + 1}/${flow.steps.length}\n\n`)
+    logToOutput(`[flow] Resuming "${flow.id}" from step ${resumeFrom + 1}`)
+  }
+
+  let stepSummary = options.resumedSummary ?? ''
 
   for (let i = 0; i < flow.steps.length; i++) {
     if (token.isCancellationRequested) {
       stream.markdown('\n_Flow cancelled by user._\n')
       return
+    }
+
+    // Skip already-completed steps when resuming
+    if (i < resumeFrom) {
+      stream.markdown(`~~Step ${i + 1}~~ _(resumed — skipped)_\n`)
+      continue
     }
 
     const step = flow.steps[i]
@@ -2681,21 +2806,17 @@ async function runFlow(
       stepSummary += `\n--- Step ${i + 1} (${agent.name ?? agent.id}) ---\n${compact}\n`
       logToOutput(`[flow] Step ${i + 1} completed (${stepText.length} chars, ${stepToolCalls} tool calls)`)
 
-      // Between-step confirmation (skip on last step and when autopilot is on)
-      const isLastStep = i === flow.steps.length - 1
-      if (!isLastStep && !options.autopilot) {
-        const choice = await vscode.window.showInformationMessage(
-          `Step ${i + 1}/${flow.steps.length} complete. Continue to step ${i + 2}?`,
-          'Continue',
-          'Stop',
-        )
-        if (choice !== 'Continue') {
-          stream.markdown(`\nFlow stopped after step ${i + 1}.`)
-          return
-        }
-      }
+      // Persist state after each step so --resume can pick up from here
+      await saveFlowState({
+        flowId: flow.id,
+        completedSteps: i + 1,
+        stepSummary,
+        startedAt,
+        updatedAt: new Date().toISOString(),
+      })
+
     } catch (err) {
-      stream.markdown(`\n❌ Step ${i + 1} failed: ${String(err)}. Flow aborted.`)
+      stream.markdown(`\n❌ Step ${i + 1} failed: ${String(err)}. Flow aborted.\n\n> Use \`/flow ${flow.id} --resume\` to retry from this step.`)
       logToOutput(`[flow] Step ${i + 1} error: ${String(err)}`)
       return
     } finally {
@@ -2703,6 +2824,7 @@ async function runFlow(
     }
   }
 
+  await deleteFlowState(flow.id)
   stream.markdown(`\n✅ Flow **${flow.name ?? flow.id}** completed.`)
   logToOutput(`[flow] "${flow.id}" completed`)
 }

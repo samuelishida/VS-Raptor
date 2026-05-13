@@ -4,6 +4,7 @@
   "description": "Agent orchestrator with specialist skills for coding workflows, code review, planning, refactoring, and agent-flow design.",
   "keywords": ["coding", "agent", "orchestrator", "workflow", "audit", "review", "planning"],
   "skills": "./skills",
+  "agents": "./agents",
   "author": {
     "name": "Samuel Ishida"
   }

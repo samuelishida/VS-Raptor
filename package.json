@@ -108,7 +108,7 @@
 				},
 				{
 					"name": "flow",
-					"description": "Run a specific flow"
+					"description": "Run a flow: /flow <id> [--resume] [--accept-models] [--keep-current]. Use /flow --list to see saved states, /flow <id> --memory to view saved summary."
 				},
 				{
 					"name": "models",
@@ -126,7 +126,7 @@
 			"properties": {
 				"raptor.maxIterations": {
 					"type": "number",
-					"default": 100,
+					"default": 150,
 					"minimum": 1,
 					"description": "Maximum iterations for the main agent loop per request."
 				},

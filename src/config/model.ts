@@ -15,7 +15,7 @@ export interface ModelSpec {
 export function getConfig(): RaptorConfig {
   const cfg = vscode.workspace.getConfiguration('raptor')
   return {
-    maxIterations: cfg.get<number>('maxIterations', 100),
+    maxIterations: cfg.get<number>('maxIterations', 150),
     spawnAgentMaxIterations: cfg.get<number>('spawnAgentMaxIterations', 60),
     preferredModel: cfg.get<string>('model', 'claude-sonnet-4.6'),
   }

@@ -2,13 +2,13 @@
 
 Agent orchestrator that routes tasks to specialist skills, builds custom agent flows, and runs multi-step automations.
 
-Works as a **VS Code extension**, a **Claude Code plugin**, and an **npm-installable skill pack** for Codex and OpenCode.
+Works as a **VS Code extension**, a **Claude Code plugin**, and an **npm-installable skill pack** for any AI coding tool.
 
 ## Features
 
 - **Chat Participant**: Interact with `@raptor` directly in VS Code's chat panel
 - **Skill Router**: Built-in skills for fix-bug, plan, code-audit, refactor, review, and more
-- **Agent Flows**: Run multi-step flows that sequence different agents and models
+- **Agent Flows**: Run multi-step flows that sequence different agents and models (VS Code only — see note below)
 - **Provider Switching**: Route to VS Code models, Anthropic, OpenAI, OpenRouter, Ollama, or CLI tools per agent or flow step
 - **Memory System**: Persistent global and project-scoped memory across sessions
 - **LSP Integration**: Go-to-definition, find references, and diagnostics
@@ -61,11 +61,10 @@ Claude Code discovers plugins in global `node_modules` by scanning for `plugin.j
 **Install from local path (development):**
 
 ```bash
-# In your project or globally
 claude plugin install /path/to/raptor
 ```
 
-This loads the `skills/` and `agents/` directories into Claude Code's skill/agent system, making all Raptor skills available as `/` slash commands.
+This loads `skills/` and `agents/` into Claude Code's skill/agent system, making all Raptor skills available as `/` slash commands.
 
 **Available after install:**
 
@@ -80,17 +79,165 @@ This loads the `skills/` and `agents/` directories into Claude Code's skill/agen
 | `review-large-pr` | Chunked PR review for 30+ file changes |
 | and more... | See `skills/` directory |
 
+> **Note:** The `agent-flow-builder` skill generates `.raptor/agents.json` and `flows.json` config files in any tool. The multi-step flow *runner* (`/flow <id>` with model-per-step switching and between-step confirmations) is VS Code only. In Claude Code and other CLI tools, flows are executed conversationally by the AI following the skill process.
+
 ---
 
-### Codex CLI
+### Cursor
 
-Codex does not have a native plugin format, but you can reference Raptor's skill instructions from your Codex config:
+Cursor supports custom rules and system prompt injection via `.cursor/rules/`.
 
 ```bash
 npm install -g raptor
 ```
 
-Then in `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`), add instructions referencing the installed skill files:
+Create `.cursor/rules/raptor.mdc`:
+
+```markdown
+---
+description: Raptor orchestrator — route all coding tasks through the right specialist skill
+alwaysApply: true
+---
+
+{{{ file NODE_MODULES_PATH/raptor/agents/raptor.md }}}
+```
+
+Or copy the skill files directly:
+
+```bash
+mkdir -p .cursor/rules
+cp "$(npm root -g)/raptor/agents/raptor.md" .cursor/rules/raptor.mdc
+```
+
+For individual skills, copy specific `skills/<name>/SKILL.md` files as additional rule files.
+
+---
+
+### Windsurf
+
+Windsurf uses `.windsurf/rules/` for global and workspace rules.
+
+```bash
+npm install -g raptor
+```
+
+Copy the orchestrator into your workspace rules:
+
+```bash
+mkdir -p .windsurf/rules
+cp "$(npm root -g)/raptor/agents/raptor.md" .windsurf/rules/raptor.md
+```
+
+Or reference individual skills:
+
+```bash
+cp "$(npm root -g)/raptor/skills/fix-bug/SKILL.md" .windsurf/rules/fix-bug.md
+cp "$(npm root -g)/raptor/skills/code-audit/SKILL.md" .windsurf/rules/code-audit.md
+```
+
+---
+
+### Cline / Roo Code
+
+Cline and Roo Code support custom instructions via `.clinerules` (workspace) or global settings.
+
+```bash
+npm install -g raptor
+```
+
+**Workspace rules** — create `.clinerules`:
+
+```bash
+cat "$(npm root -g)/raptor/agents/raptor.md" > .clinerules
+```
+
+**Custom modes (Roo Code)** — add a `raptor` mode in Roo Code settings, pasting the contents of `agents/raptor.md` as the system prompt.
+
+---
+
+### Continue.dev
+
+Continue supports context providers and system prompt injection via `~/.continue/config.json`.
+
+```bash
+npm install -g raptor
+```
+
+Add to `~/.continue/config.json`:
+
+```json
+{
+  "systemMessage": "$(cat $(npm root -g)/raptor/agents/raptor.md)"
+}
+```
+
+Or statically paste the contents of `agents/raptor.md` into the `systemMessage` field.
+
+For skill-specific contexts, use Continue's `@file` context provider pointing at individual skill files:
+
+```
+@file ~/.../node_modules/raptor/skills/fix-bug/SKILL.md Fix this bug.
+```
+
+---
+
+### Aider
+
+Aider supports custom instructions via `--system-prompt` or `.aider.conf.yml`.
+
+```bash
+npm install -g raptor
+```
+
+**One-off:**
+
+```bash
+aider --system-prompt "$(cat $(npm root -g)/raptor/agents/raptor.md)"
+```
+
+**Persistent** — add to `.aider.conf.yml` in your project or `~/.aider.conf.yml`:
+
+```yaml
+system-prompt: /path/to/node_modules/raptor/agents/raptor.md
+```
+
+For skill-specific workflows:
+
+```bash
+aider --system-prompt "$(cat $(npm root -g)/raptor/skills/fix-bug/SKILL.md)"
+```
+
+---
+
+### Gemini CLI
+
+Gemini CLI supports system instructions via `--system-instruction` or a `GEMINI_SYSTEM_INSTRUCTION` env var.
+
+```bash
+npm install -g raptor
+```
+
+**Per-session:**
+
+```bash
+gemini --system-instruction "$(cat $(npm root -g)/raptor/agents/raptor.md)"
+```
+
+**Persistent** — set in your shell profile:
+
+```bash
+export GEMINI_SYSTEM_INSTRUCTION="$(cat $(npm root -g)/raptor/agents/raptor.md)"
+```
+
+---
+
+### Codex CLI
+
+```bash
+npm install -g raptor
+```
+
+In `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`):
 
 ```toml
 instructions = """
@@ -101,7 +248,11 @@ Follow the Raptor orchestration process. Route tasks to the appropriate workflow
 """
 ```
 
-Or point Codex at the `agents/raptor.md` file directly as an instructions source.
+Or point Codex at the orchestrator agent directly:
+
+```toml
+instructions-file = "/path/to/node_modules/raptor/agents/raptor.md"
+```
 
 ---
 
@@ -111,15 +262,35 @@ Or point Codex at the `agents/raptor.md` file directly as an instructions source
 npm install -g raptor
 ```
 
-In your `.opencode/config.json` (workspace) or `~/.opencode/config.json` (global):
+In `.opencode/config.json` (workspace) or `~/.opencode/config.json` (global):
 
 ```json
 {
-  "instructions": "path/to/node_modules/raptor/agents/raptor.md"
+  "instructions": "/path/to/node_modules/raptor/agents/raptor.md"
 }
 ```
 
-Or use the Raptor config importer — if you have a `.raptor/agents.json` in your workspace, Raptor's VS Code extension will pick it up automatically alongside `.opencode` configs.
+Use `npm root -g` to get the global node_modules path.
+
+---
+
+### Any other AI tool
+
+If your tool accepts a system prompt, instructions file, or rules file, paste the contents of:
+
+```bash
+cat "$(npm root -g)/raptor/agents/raptor.md"
+```
+
+For specific skills instead of full orchestration:
+
+```bash
+# List available skills
+ls "$(npm root -g)/raptor/skills/"
+
+# Get a skill's content
+cat "$(npm root -g)/raptor/skills/fix-bug/SKILL.md"
+```
 
 ---
 
@@ -160,7 +331,7 @@ Raptor can route requests to multiple model providers. Configure via VS Code set
 | `anthropic` | `native-tools` | ✓ | Direct Anthropic API — requires API key |
 | `openai` | `native-text` | pending | Direct OpenAI API — requires API key |
 | `openrouter` | `native-text` | pending | OpenRouter — requires API key |
-| `ollama` | `native-text` | ✗ | Local models — requires running Ollama server |
+| `ollama` | `native-tools` | ✓ | Local models — requires running Ollama server |
 | `claude-code` | `delegated` | ✗ | Claude Code CLI subprocess |
 | `codex` | `delegated` | ✗ | Codex CLI subprocess |
 | `opencode` | `delegated` | ✗ | OpenCode CLI subprocess |
@@ -305,6 +476,7 @@ Also supports `skills/<name>/SKILL.md` format (used by Raptor's own built-in ski
 
 - `summaryBudget` — max characters of previous step output passed to next step
 - Step `model`/`skills`/`tools` override the agent's own settings for that step only
+- Flow *execution* (`/flow <id>`) is VS Code only; other tools use `flows.json` as design reference
 
 ---
 
