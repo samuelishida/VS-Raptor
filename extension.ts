@@ -2120,6 +2120,7 @@ async function handleChatRequest(
     const flowId = flowParts[0] ?? ''
     const allowModelChanges = flowParts.includes('--accept-models')
     const keepCurrentModel = flowParts.includes('--keep-current')
+    const useChat = flowParts.includes('--chat')
     const doResume = flowParts.includes('--resume')
     const doMemory = flowParts.includes('--memory')
 
@@ -2146,7 +2147,7 @@ async function handleChatRequest(
     }
 
     if (!flowId) {
-      stream.markdown('Usage: `/flow <id> [--resume] [--accept-models] [--keep-current]` — run a flow. `/flow --list` lists saved states. `/flow <id> --memory` shows a flow\'s saved summary.')
+      stream.markdown('Usage: `/flow <id> [--resume] [--accept-models] [--keep-current] [--chat]` — run a flow. `/flow --list` lists saved states. `/flow <id> --memory` shows a flow\'s saved summary.')
       return {}
     }
 
@@ -2178,13 +2179,13 @@ async function handleChatRequest(
     }
     const currentAgent = loaded.agents.get(inferActiveAgent(chatContext)) ?? loaded.agents.get('_default')!
     const currentModelSpec = currentAgent.model ?? inferActiveModel(chatContext) ?? getConfiguredFallbackModel()
-    // Skip the model-change gate — flow steps use configured providers, not the VS Code chat UI model.
-    if (!allowModelChanges && !keepCurrentModel) {
+    if (!allowModelChanges && !keepCurrentModel && !useChat) {
       const modelChanges = collectFlowModelChanges(flow, loaded, currentModelSpec)
       if (modelChanges.length > 0) {
         const rows = modelChanges.map(change =>
           `| ${change.step} | \`${change.agent}\` | \`${change.from}\` | \`${change.to}\` |`
         )
+        const chatModelLabel = request.model ? `\`${request.model.id}\`` : 'chat UI selection'
         stream.markdown([
           `Flow **${flow.name ?? flow.id}** wants to change models between steps.`,
           '',
@@ -2192,7 +2193,8 @@ async function handleChatRequest(
           '|---|---|---|---|',
           ...rows,
           '',
-          `Reply with \`/flow ${flow.id} --accept-models\` to use the flow's configured models, or \`/flow ${flow.id} --keep-current\` to run every step with \`${currentModelSpec}\`.`,
+          `Reply with \`/flow ${flow.id} --accept-models\` to use the flow's configured models, \`/flow ${flow.id} --keep-current\` to run every step with \`${currentModelSpec}\`, or \`/flow ${flow.id} --chat\` to use ${chatModelLabel} for all steps.`,
+          `Add \`--autopilot\` to skip between-step confirmations.`,
         ].join('\n'))
         return {}
       }
@@ -2209,7 +2211,7 @@ async function handleChatRequest(
         stream.markdown(`> No saved state for flow "${flow.id}" — starting fresh.\n\n`)
       }
     }
-    await runFlow(flow, loaded, request, chatContext, stream, token, { allowModelChanges, keepCurrentModel, currentModelSpec, resumeFromStep, resumedSummary })
+    await runFlow(flow, loaded, request, chatContext, stream, token, { allowModelChanges, keepCurrentModel, useChat, currentModelSpec, resumeFromStep, resumedSummary })
     return {}
   }
 
@@ -2616,6 +2618,7 @@ async function listFlowStates(): Promise<FlowState[]> {
 interface FlowRunOptions {
   allowModelChanges?: boolean
   keepCurrentModel?: boolean
+  useChat?: boolean
   currentModelSpec?: string
   resumeFromStep?: number
   resumedSummary?: string
@@ -2678,7 +2681,9 @@ async function runFlow(
     const agent = loaded.agents.get(step.agent) ?? loaded.agents.get('_default')!
     const modelSpec = options.keepCurrentModel
       ? options.currentModelSpec
-      : step.model ?? agent.model
+      : options.useChat
+        ? request.model?.id
+        : step.model ?? agent.model
     const stepAgent: Agent = {
       ...agent,
       model: modelSpec,
@@ -2686,11 +2691,12 @@ async function runFlow(
       tools: step.tools ?? agent.tools,
     }
 
+    const skipOverride = options.keepCurrentModel || options.useChat
     let resolved: ResolvedModel
     try {
       resolved = await getRegistry().resolve({
-        flowStepModel: options.keepCurrentModel ? undefined : modelSpec,
-        agentModel: options.keepCurrentModel ? undefined : agent.model,
+        flowStepModel: skipOverride ? undefined : modelSpec,
+        agentModel: skipOverride ? undefined : agent.model,
         sessionModel: request.model ? { providerId: 'vscode', modelId: request.model.id } : undefined,
         fallbackModel: getConfiguredFallbackModel(),
       })
