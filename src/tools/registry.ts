@@ -8,7 +8,7 @@ export function getToolDefs(): vscode.LanguageModelChatTool[] {
       inputSchema: {
         type: 'object' as const,
         properties: {
-          path:      { type: 'string', description: 'Absolute or workspace-relative path' },
+          path:      { type: 'string', description: 'Workspace-relative path. Absolute paths outside the workspace are rejected.' },
           startLine: { type: 'number', description: 'First line to read (1-based)' },
           endLine:   { type: 'number', description: 'Last line to read (1-based)' },
         },
@@ -21,7 +21,7 @@ export function getToolDefs(): vscode.LanguageModelChatTool[] {
       inputSchema: {
         type: 'object' as const,
         properties: {
-          path:    { type: 'string', description: 'Absolute or workspace-relative path' },
+          path:    { type: 'string', description: 'Workspace-relative path. Absolute paths outside the workspace are rejected.' },
           content: { type: 'string', description: 'Complete file content to write' },
         },
         required: ['path', 'content'],
@@ -37,7 +37,7 @@ export function getToolDefs(): vscode.LanguageModelChatTool[] {
       inputSchema: {
         type: 'object' as const,
         properties: {
-          path:       { type: 'string',  description: 'Absolute or workspace-relative path' },
+          path:       { type: 'string',  description: 'Workspace-relative path. Absolute paths outside the workspace are rejected.' },
           oldString:  { type: 'string',  description: 'Exact string to replace (include context lines)' },
           newString:  { type: 'string',  description: 'Replacement string' },
           replaceAll: { type: 'boolean', description: 'Replace ALL occurrences instead of just the first' },
@@ -60,7 +60,7 @@ export function getToolDefs(): vscode.LanguageModelChatTool[] {
             items: {
               type: 'object',
               properties: {
-                path:       { type: 'string',  description: 'Absolute or workspace-relative path' },
+                path:       { type: 'string',  description: 'Workspace-relative path. Absolute paths outside the workspace are rejected.' },
                 oldString:  { type: 'string',  description: 'Exact string to replace (include context lines)' },
                 newString:  { type: 'string',  description: 'Replacement string' },
                 replaceAll: { type: 'boolean', description: 'Replace ALL occurrences in this file' },
@@ -149,7 +149,7 @@ export function getToolDefs(): vscode.LanguageModelChatTool[] {
     },
     {
       name: 'todoWrite',
-      description: 'Persist a structured todo list to .raptor-todos.json in the workspace root.',
+      description: 'Persist a structured todo list to the current workspace .raptor/todos.json.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -173,19 +173,19 @@ export function getToolDefs(): vscode.LanguageModelChatTool[] {
     },
     {
       name: 'memoryRead',
-      description: 'Read persistent memory. scope="all" (default) reads both global + project memory. scope="global" reads user-wide facts. scope="project" reads workspace-specific facts.',
+      description: 'Read persistent memory. scope="project" (default) reads workspace-specific facts. scope="global" reads user-wide facts. scope="all" reads both.',
       inputSchema: {
         type: 'object' as const,
         properties: {
-          scope: { type: 'string', enum: ['all', 'global', 'project'], description: 'Which memory to read (default: all)' },
+          scope: { type: 'string', enum: ['all', 'global', 'project'], description: 'Which memory to read (default: project)' },
         },
       },
     },
     {
       name: 'memoryWrite',
       description:
-        'Write or update a memory entry. scope="global" for user-wide facts (preferences, patterns). ' +
-        'scope="project" for workspace-specific facts (architecture, build commands, known issues). ' +
+        'Write or update a memory entry. scope="project" (default) for workspace-specific facts (architecture, build commands, known issues). ' +
+        'scope="global" for explicitly user-wide facts (preferences, patterns). ' +
         'Memories persist across sessions and are auto-injected into context.',
       inputSchema: {
         type: 'object' as const,
@@ -193,7 +193,7 @@ export function getToolDefs(): vscode.LanguageModelChatTool[] {
           topic:   { type: 'string', description: 'Topic heading (e.g. "project-structure", "user-preferences", "build-commands")' },
           content: { type: 'string', description: 'The memory content to save' },
           replace: { type: 'boolean', description: 'Replace existing section with same topic (default: false = append)' },
-          scope:   { type: 'string', enum: ['global', 'project'], description: 'Where to save: global (~/.raptor/) or project (<workspace>/.raptor/). Default: global' },
+          scope:   { type: 'string', enum: ['global', 'project'], description: 'Where to save: project (<workspace>/.raptor/) or global (~/.raptor/). Default: project' },
         },
         required: ['content'],
       },

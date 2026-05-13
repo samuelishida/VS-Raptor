@@ -54,6 +54,7 @@ Follow the routed skill's process completely.
 
 ## Rules
 
+- Keep runtime artifacts workspace-local: `.raptor/MEMORY.md`, `.raptor/todos.json`, `.raptor/flow-state/`, `.raptor/history/`, and `.plans/`. Use global memory only when the user explicitly asks for user-wide facts.
 - Check `.plans/` for existing plans before routing to `plan-small` or `plan-large`; resume the plan instead.
 - If intent is ambiguous, ask one clarifying question.
 - Any request mentioning "agent", "flow", "workflow", "automate", or "pipeline" always routes to `agent-flow-builder`.

@@ -138,10 +138,9 @@ function extensionTempDir(): string {
 // ═══════════════════════════════════════════════════════════════════════════════
 // ─── PERSISTENT MEMORY SYSTEM ────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
-// Two tiers:
-//   1. GLOBAL memory  — ~/.raptor/memory/MEMORY.md  (user-wide facts, preferences)
-//   2. PROJECT memory  — <workspace>/.raptor/MEMORY.md  (project-specific knowledge)
-// Both are auto-injected into the system prompt.
+// Memory defaults to project-local state:
+//   <workspace>/.raptor/MEMORY.md
+// Global memory remains available only by explicit scope="global" reads/writes.
 
 const MEMORY_MAX_BYTES = 25 * 1024       // 25 KB per entry
 const MEMORY_INDEX_MAX_LINES = 200       // keep index under 200 lines
@@ -160,6 +159,10 @@ function projectMemoryPath(): string | null {
 function projectHistoryDir(): string | null {
   const dir = projectClawdDir()
   return dir ? path.join(dir, 'history') : null
+}
+function todoPath(): string {
+  const dir = projectClawdDir()
+  return path.join(dir ?? raptorDataDir(), 'todos.json')
 }
 
 async function readMemoryIndex(): Promise<string> {
@@ -309,6 +312,27 @@ const MICRO_COMPACT_THRESHOLD  = 60_000
 const FULL_COMPACT_THRESHOLD   = 85_000
 const MICRO_COMPACT_TOOL_LIMIT = 2_048
 
+interface CompactThresholds {
+  micro: number
+  full: number
+}
+
+function compactThresholdsForModel(model: RaptorModel): CompactThresholds {
+  const maxInput = model.maxInputTokens
+  if (!maxInput || maxInput <= 0) {
+    return { micro: MICRO_COMPACT_THRESHOLD, full: FULL_COMPACT_THRESHOLD }
+  }
+
+  return {
+    micro: Math.max(1_500, Math.floor(maxInput * 0.65)),
+    full: Math.max(2_000, Math.floor(maxInput * 0.82)),
+  }
+}
+
+function contextWindowNote(model: RaptorModel): string {
+  return model.maxInputTokens ? `; context ${model.maxInputTokens.toLocaleString()}` : ''
+}
+
 function estimateTokens(messages: RaptorMessage[]): number {
   let total = 0
   for (const msg of messages) {
@@ -398,7 +422,6 @@ async function fullCompactMessages(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function sessionSummaryPath(): string {
-  // Prefer project-local, fall back to global
   const pDir = projectClawdDir()
   return pDir ? path.join(pDir, 'last-session-summary.md') : path.join(raptorDataDir(), 'last-session-summary.md')
 }
@@ -408,22 +431,14 @@ async function saveSessionSummary(summary: string): Promise<void> {
     const p = sessionSummaryPath()
     await fs.mkdir(path.dirname(p), { recursive: true })
     await fs.writeFile(p, summary, 'utf-8')
-    // Also save to global for cross-project resume
-    const globalPath = path.join(raptorDataDir(), 'last-session-summary.md')
-    await fs.mkdir(path.dirname(globalPath), { recursive: true })
-    await fs.writeFile(globalPath, summary, 'utf-8')
   } catch { /* silent */ }
 }
 
 async function loadSessionSummary(): Promise<string | null> {
-  // Try project-local first, then global
-  for (const p of [sessionSummaryPath(), path.join(raptorDataDir(), 'last-session-summary.md')]) {
-    try {
-      const content = await fs.readFile(p, 'utf-8')
-      if (content.trim()) return content.replace(/\r\n/g, '\n')
-    } catch { /* try next */ }
-  }
-  return null
+  try {
+    const content = await fs.readFile(sessionSummaryPath(), 'utf-8')
+    return content.trim() ? content.replace(/\r\n/g, '\n') : null
+  } catch { return null }
 }
 
 // ── Conversation history persistence ────────────────────────────────────────
@@ -469,7 +484,7 @@ async function saveConversationHistory(
 }
 
 async function loadRecentHistory(): Promise<ConversationSnapshot | null> {
-  const dirs = [projectHistoryDir(), path.join(raptorDataDir(), 'history')].filter(Boolean) as string[]
+  const dirs = [projectHistoryDir() ?? path.join(raptorDataDir(), 'history')]
   for (const hDir of dirs) {
     try {
       const files = (await fs.readdir(hDir)).filter(f => f.startsWith('session-') && f.endsWith('.json')).sort()
@@ -537,14 +552,10 @@ async function extractAndStoreMemories(
     if (!model) return
 
     const extractPrompt = [
-      'Analyse this Q&A exchange. Extract two categories of facts:',
+      'Analyse this Q&A exchange. Extract project-specific facts for the current workspace only.',
       '',
-      '## DURABLE FACTS (project-agnostic)',
-      'User preferences, coding style, general decisions. 0-3 items.',
-      'Format: "- [global] <fact>"',
-      '',
-      '## PROJECT FACTS (specific to the codebase being worked on)',
-      'File conventions, architecture decisions, build commands, known issues. 0-4 items.',
+      '## PROJECT FACTS',
+      'File conventions, architecture decisions, build commands, known issues, and workflow state. 0-5 items.',
       'Format: "- [project] <fact>"',
       '',
       '## CORRECTIONS (if the user corrected the assistant)',
@@ -571,31 +582,18 @@ async function extractAndStoreMemories(
     if (!extracted || extracted.includes('(none)') || extracted.length < 10) return
 
     const lines = extracted.split('\n').map(l => l.trim()).filter(l => l.startsWith('- '))
-    const globalFacts:  string[] = []
     const projectFacts: string[] = []
 
     for (const line of lines) {
       const text = line.replace(/^- \[(global|project|correction)\]\s*/i, '- ')
       if (/\[correction\]/i.test(line)) {
-        // Corrections go to BOTH global and project memory (high priority)
-        globalFacts.push(`- **CORRECTION**: ${text.replace(/^- /, '')}`)
         projectFacts.push(`- **CORRECTION**: ${text.replace(/^- /, '')}`)
-      } else if (/\[project\]/i.test(line)) {
-        projectFacts.push(text)
       } else {
-        globalFacts.push(text)
+        projectFacts.push(text)
       }
     }
 
     const timestamp = new Date().toISOString().split('T')[0]
-
-    // Save global facts
-    if (globalFacts.length > 0) {
-      let index = await readMemoryIndex()
-      const block = `## session-facts (${timestamp})\n${globalFacts.join('\n')}\n`
-      index = index ? index.trimEnd() + '\n\n' + block : block
-      await writeMemoryIndex(index)
-    }
 
     // Save project facts
     if (projectFacts.length > 0) {
@@ -1645,10 +1643,9 @@ async function toolGetDiagnostics(input: ToolInput): Promise<string> {
 // ── todoWrite ────────────────────────────────────────────────────────────
 async function toolTodoWrite(input: ToolInput): Promise<string> {
   const todos = input['todos']
-  const dataDir = raptorDataDir()
+  const filePath = todoPath()
   try {
-    await fs.mkdir(dataDir, { recursive: true })
-    const filePath = path.join(dataDir, 'todos.json')
+    await fs.mkdir(path.dirname(filePath), { recursive: true })
     await fs.writeFile(filePath, JSON.stringify(todos, null, 2), 'utf-8')
     const count = Array.isArray(todos) ? todos.length : '?'
     return `✓ Saved ${count} todos to ${filePath}`
@@ -1659,7 +1656,7 @@ async function toolTodoWrite(input: ToolInput): Promise<string> {
 
 // ── memoryRead ───────────────────────────────────────────────────────────
 async function toolMemoryRead(input?: ToolInput): Promise<string> {
-  const scope = (input?.['scope'] as string | undefined) ?? 'all'
+  const scope = (input?.['scope'] as string | undefined) ?? 'project'
   const parts: string[] = []
 
   if (scope === 'all' || scope === 'global') {
@@ -1679,7 +1676,7 @@ async function toolMemoryWrite(input: ToolInput): Promise<string> {
   const topic   = (input['topic']   as string | undefined) ?? 'general'
   const content = input['content']  as string
   const replace = (input['replace'] as boolean | undefined) ?? false
-  const scope   = (input['scope']   as string | undefined) ?? 'global'
+  const scope   = (input['scope']   as string | undefined) ?? 'project'
 
   if (!content?.trim()) return 'Error: content is required'
 
@@ -1936,11 +1933,17 @@ async function handleChatRequest(
   }
 
   if (request.command === 'memory' || promptTrimmed === '/memory') {
-    const [globalMem, projectMem] = await Promise.all([readMemoryIndex(), readProjectMemory()])
+    const showGlobal = /\s--global(?:\s|$)/.test(promptTrimmed) || /\s--all(?:\s|$)/.test(promptTrimmed)
+    const [globalMem, projectMem] = await Promise.all([
+      showGlobal ? readMemoryIndex() : Promise.resolve(''),
+      readProjectMemory(),
+    ])
     const parts: string[] = []
-    if (globalMem.trim()) parts.push(`## Global Memory\n\n${globalMem}`)
     if (projectMem.trim()) parts.push(`## Project Memory\n\n${projectMem}`)
-    stream.markdown(parts.length > 0 ? parts.join('\n\n---\n\n') : '_(no memories stored yet)_')
+    if (globalMem.trim()) parts.push(`## Global Memory\n\n${globalMem}`)
+    stream.markdown(parts.length > 0
+      ? parts.join('\n\n---\n\n')
+      : showGlobal ? '_(no memories stored yet)_' : '_(no project memories stored yet; use `/memory --global` to include global memory)_')
     return {}
   }
 
@@ -1969,7 +1972,7 @@ async function handleChatRequest(
   }
 
   if (request.command === 'todos' || promptTrimmed === '/todos') {
-    const todosPath = path.join(raptorDataDir(), 'todos.json')
+    const todosPath = todoPath()
     let raw = ''
     try { raw = await fs.readFile(todosPath, 'utf-8') } catch { /* not found */ }
     if (!raw.trim()) {
@@ -1983,20 +1986,23 @@ async function handleChatRequest(
             `${statusIcon(t.status ?? '')} **${t.title ?? t.id ?? '?'}** \`[${t.status ?? '?'}]\`` +
             (t.description ? `\n   > ${t.description}` : '')
           ).join('\n')
-          stream.markdown(`**Todos:**\n\n${rows}`)
+          stream.markdown(`**Todos** (${todosPath}):\n\n${rows}`)
         } else {
-          stream.markdown(`**Todos:**\n\`\`\`json\n${raw}\n\`\`\``)
+          stream.markdown(`**Todos** (${todosPath}):\n\`\`\`json\n${raw}\n\`\`\``)
         }
-      } catch { stream.markdown(`**Todos:**\n\`\`\`json\n${raw}\n\`\`\``) }
+      } catch { stream.markdown(`**Todos** (${todosPath}):\n\`\`\`json\n${raw}\n\`\`\``) }
     }
     return {}
   }
 
   if (request.command === 'clearmemory' || promptTrimmed === '/clearmemory') {
+    const clearGlobal = /\s--global(?:\s|$)/.test(promptTrimmed) || /\s--all(?:\s|$)/.test(promptTrimmed)
     const cleared: string[] = []
-    try { await fs.unlink(memoryIndexPath()); cleared.push('global') } catch { /* */ }
     const pm = projectMemoryPath()
     if (pm) { try { await fs.unlink(pm); cleared.push('project') } catch { /* */ } }
+    if (clearGlobal) {
+      try { await fs.unlink(memoryIndexPath()); cleared.push('global') } catch { /* */ }
+    }
     stream.markdown(cleared.length > 0 ? `Cleared: ${cleared.join(', ')} memory.` : 'No memory to clear.')
     return {}
   }
@@ -2098,7 +2104,9 @@ async function handleChatRequest(
       const models = await p.listModels().catch(() => [])
       const available = providerStatus ? providerStatus.available : models.length > 0
       const statusIcon = available ? '✓' : '✗'
-      const modelList = models.map(m => m.id).join(', ') || (providerStatus && !providerStatus.available && providerStatus.reason ? `(${providerStatus.reason})` : '(no models)')
+      const modelList = models
+        .map(m => m.maxInputTokens ? `${m.id} (${m.maxInputTokens.toLocaleString()} ctx)` : m.id)
+        .join(', ') || (providerStatus && !providerStatus.available && providerStatus.reason ? `(${providerStatus.reason})` : '(no models)')
       rows.push(`| \`${p.id}\` | ${p.name} | ${p.capability} | ${statusIcon} | ${modelList} |`)
     }
     stream.markdown([
@@ -2130,17 +2138,21 @@ async function handleChatRequest(
       if (states.length === 0) {
         stream.markdown('No saved flow states. States are saved automatically when a flow is interrupted.')
       } else {
-        const rows = states.map(s =>
-          `| \`${s.flowId}\` | ${s.completedSteps} steps done | ${new Date(s.updatedAt).toLocaleString()} |`
-        )
+        const rows = states.map(s => {
+          const status = s.status ?? 'running'
+          const progress = status === 'completed'
+            ? `${s.completedSteps} steps done`
+            : `${s.completedSteps} steps done, next step ${s.completedSteps + 1}`
+          return `| \`${s.flowId}\` | ${status} | ${progress} | ${new Date(s.updatedAt).toLocaleString()} |`
+        })
         stream.markdown([
           '## Saved flow states',
           '',
-          '| Flow | Progress | Last updated |',
-          '|---|---|---|',
+          '| Flow | Status | Progress | Last updated |',
+          '|---|---|---|---|',
           ...rows,
           '',
-          'Resume with `/flow <id> --resume`. View summary with `/flow <id> --memory`.',
+          'Resume incomplete flows with `/flow <id> --resume`. View summary with `/flow <id> --memory`.',
         ].join('\n'))
       }
       return {}
@@ -2160,6 +2172,7 @@ async function handleChatRequest(
         stream.markdown([
           `## Flow memory: \`${saved.flowId}\``,
           '',
+          `**Status:** ${saved.status ?? 'running'}`,
           `**Progress:** ${saved.completedSteps} steps completed`,
           `**Started:** ${new Date(saved.startedAt).toLocaleString()}`,
           `**Updated:** ${new Date(saved.updatedAt).toLocaleString()}`,
@@ -2185,7 +2198,7 @@ async function handleChatRequest(
         const rows = modelChanges.map(change =>
           `| ${change.step} | \`${change.agent}\` | \`${change.from}\` | \`${change.to}\` |`
         )
-        const chatModelLabel = request.model ? `\`${request.model.id}\`` : 'chat UI selection'
+        const chatModelLabel = request.model ? `\`${request.model.id}\`` : 'the current chat model'
         stream.markdown([
           `Flow **${flow.name ?? flow.id}** wants to change models between steps.`,
           '',
@@ -2201,17 +2214,36 @@ async function handleChatRequest(
     }
     let resumeFromStep: number | undefined
     let resumedSummary: string | undefined
+    let resumedOriginalPrompt: string | undefined
     if (doResume) {
       const saved = await loadFlowState(flow.id)
       if (saved) {
+        if ((saved.status ?? 'running') === 'completed' || saved.completedSteps >= flow.steps.length) {
+          stream.markdown([
+            `Flow **${flow.name ?? flow.id}** already completed (${saved.completedSteps}/${flow.steps.length} steps).`,
+            '',
+            `Run \`/flow ${flow.id} --memory\` to inspect the saved summary, or run \`/flow ${flow.id} --chat\` to start a fresh execution.`,
+          ].join('\n'))
+          return {}
+        }
         resumeFromStep = saved.completedSteps
         resumedSummary = saved.stepSummary
+        resumedOriginalPrompt = saved.originalPrompt
         stream.markdown(`> ↩ Resuming **${flow.name ?? flow.id}** from step ${resumeFromStep + 1} (${flow.steps.length - resumeFromStep} remaining)\n\n`)
       } else {
-        stream.markdown(`> No saved state for flow "${flow.id}" — starting fresh.\n\n`)
+        stream.markdown(`No incomplete saved state for flow "${flow.id}". Run \`/flow ${flow.id} --chat\` to start fresh.`)
+        return {}
       }
     }
-    await runFlow(flow, loaded, request, chatContext, stream, token, { allowModelChanges, keepCurrentModel, useChat, currentModelSpec, resumeFromStep, resumedSummary })
+    await runFlow(flow, loaded, request, chatContext, stream, token, {
+      allowModelChanges,
+      keepCurrentModel,
+      useChat,
+      currentModelSpec,
+      resumeFromStep,
+      resumedSummary,
+      originalPrompt: doResume ? resumedOriginalPrompt : request.prompt,
+    })
     return {}
   }
 
@@ -2247,7 +2279,7 @@ async function handleChatRequest(
 
   const availabilityNote = `${resolved.available.length} model${resolved.available.length === 1 ? '' : 's'} detected`
   const capNote = tools.length === 0 ? ' (text-only provider)' : ''
-  stream.progress(`raptor -> ${resolved.model.name} (${resolved.source}; ${availabilityNote}${capNote})`)
+  stream.progress(`raptor -> ${resolved.model.name} (${resolved.source}; ${availabilityNote}${contextWindowNote(resolved.model)}${capNote})`)
 
   const MAX_ITERATIONS = config.maxIterations
   let iteration = 0
@@ -2272,12 +2304,13 @@ async function handleChatRequest(
 
     // ── Context compaction ──────────────────────────────────────────────────
     const tokenCount = estimateTokens(messages)
-    if (tokenCount > FULL_COMPACT_THRESHOLD) {
+    const thresholds = compactThresholdsForModel(resolved.model)
+    if (tokenCount > thresholds.full) {
       stream.progress(`Context full (${tokenCount.toLocaleString()} tokens) -- compacting...`)
       const compacted = await fullCompactMessages(messages, resolved, token)
       messages.length = 0
       messages.push(...compacted)
-    } else if (tokenCount > MICRO_COMPACT_THRESHOLD) {
+    } else if (tokenCount > thresholds.micro) {
       const compacted = microCompactMessages(messages)
       messages.length = 0
       messages.push(...compacted)
@@ -2409,8 +2442,7 @@ async function buildMessages(
   loaded: LoadedConfig,
 ): Promise<RaptorMessage[]> {
   // Inject persistent memory (global + project) + workspace profile into system prompt
-  const [globalMem, projectMem, wsProfile] = await Promise.all([
-    readMemoryIndex(),
+  const [projectMem, wsProfile] = await Promise.all([
     readProjectMemory(),
     getOrBuildWorkspaceProfile(),
   ])
@@ -2419,9 +2451,6 @@ async function buildMessages(
 
   if (wsProfile.trim()) {
     sections.push(`\n\n# Workspace Profile\n${wsProfile}`)
-  }
-  if (globalMem.trim()) {
-    sections.push(`\n\n# Persistent Memory (global)\nFacts saved from previous sessions across all projects:\n\n${globalMem}`)
   }
   if (projectMem.trim()) {
     sections.push(`\n\n# Project Memory\nFacts specific to this workspace/project:\n\n${projectMem}`)
@@ -2566,8 +2595,10 @@ function normalizeModelToken(value: string): string {
 
 interface FlowState {
   flowId: string
+  status?: 'running' | 'completed'
   completedSteps: number
   stepSummary: string
+  originalPrompt?: string
   startedAt: string
   updatedAt: string
 }
@@ -2596,10 +2627,6 @@ async function loadFlowState(flowId: string): Promise<FlowState | null> {
   } catch { return null }
 }
 
-async function deleteFlowState(flowId: string): Promise<void> {
-  try { await fs.unlink(flowStatePath(flowId)) } catch { /* already gone */ }
-}
-
 async function listFlowStates(): Promise<FlowState[]> {
   try {
     const dir = flowStateDir()
@@ -2622,6 +2649,7 @@ interface FlowRunOptions {
   currentModelSpec?: string
   resumeFromStep?: number
   resumedSummary?: string
+  originalPrompt?: string
 }
 
 function flowStepModelSpec(step: Flow['steps'][number], loaded: LoadedConfig, currentModelSpec: string | undefined): string {
@@ -2641,6 +2669,83 @@ function collectFlowModelChanges(flow: Flow, loaded: LoadedConfig, currentModelS
     previous = next
   }
   return changes
+}
+
+function isFlowCommandPrompt(value: string): boolean {
+  return /^\/?flow(?:\s|$)/i.test(value.trim())
+}
+
+function toolCapabilityError(providerId: string, modelId: string, toolCount: number): string {
+  return [
+    `Provider/model \`${providerId}:${modelId}\` cannot receive Raptor tools but this step requires ${toolCount} tool${toolCount === 1 ? '' : 's'}.`,
+    'Use a tool-capable provider, run without `--chat`/with `--accept-models`, or remove tools from this step.',
+  ].join(' ')
+}
+
+function looksLikeHallucinatedToolExecution(text: string): boolean {
+  const toolNames = getToolDefs().map(tool => tool.name).join('|')
+  const toolNamePattern = new RegExp(`(?:${toolNames})`, 'i')
+  if (!toolNamePattern.test(text)) return false
+
+  const fakeResultPatterns = [
+    new RegExp(`(?:^|\\n)\\s*(?:✅|✓|📄|🔧)\\s*(?:${toolNames})\\b`, 'i'),
+    new RegExp(`(?:^|\\n)\\s*(?:📄|✅|✓)\\s*(?:readFile|writeFile|editFile|multiEdit|glob|searchCode)\\s+[^\\n]+:\\s*(?:✓|\\d+|[\\w-]+\\s+lines)`, 'i'),
+    /\bPlan Created\b[\s\S]*\bPath:\s*\.plans\//i,
+    /\b(?:Applied \d+ edits|Saved \d+ todos|No diagnostics|lines read|matches found)\b/i,
+  ]
+  return fakeResultPatterns.some(pattern => pattern.test(text))
+}
+
+function stepRequiresPlanArtifact(step: Flow['steps'][number], agent: Agent): boolean {
+  const skills = [...(agent.skills ?? []), ...(step.skills ?? [])]
+    .map(skill => skill.toLowerCase())
+  if (skills.includes('plan-small') || skills.includes('plan-large')) return true
+
+  const identity = [
+    step.agent,
+    agent.id,
+    agent.name ?? '',
+    step.instruction,
+  ].join(' ').toLowerCase()
+
+  return /\bplanner\b/.test(identity) || /\bplan-(?:small|large)\b/.test(identity)
+}
+
+async function newestPlanFileSince(startedAtMs: number): Promise<string | null> {
+  const root = workspaceRoot()
+  if (!root) return null
+  const plansDir = path.join(root, '.plans')
+
+  async function walk(dir: string): Promise<string[]> {
+    let entries: import('fs').Dirent[]
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      return []
+    }
+
+    const files: string[] = []
+    for (const entry of entries) {
+      const entryPath = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        files.push(...await walk(entryPath))
+      } else if (entry.isFile() && entry.name.toLowerCase() === 'plan.md') {
+        files.push(entryPath)
+      }
+    }
+    return files
+  }
+
+  const candidates: Array<{ filePath: string; mtimeMs: number }> = []
+  for (const filePath of await walk(plansDir)) {
+    try {
+      const stat = await fs.stat(filePath)
+      if (stat.mtimeMs >= startedAtMs - 1000) candidates.push({ filePath, mtimeMs: stat.mtimeMs })
+    } catch { /* ignore */ }
+  }
+
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return candidates[0]?.filePath ?? null
 }
 
 async function runFlow(
@@ -2664,6 +2769,28 @@ async function runFlow(
   }
 
   let stepSummary = options.resumedSummary ?? ''
+  const originalPromptContext = options.originalPrompt?.trim()
+  const shouldAttachOriginalPrompt = !!originalPromptContext && !isFlowCommandPrompt(originalPromptContext)
+  let chatModel: vscode.LanguageModelChat | undefined = request.model
+  if (options.useChat && !chatModel) {
+    stream.markdown(`\n❌ No current chat model was provided by VS Code for \`--chat\`. Select a model in the chat picker and retry \`/flow ${flow.id} --chat\`.\n`)
+    return
+  }
+  if (options.useChat) {
+    setVSCodeSessionModel(chatModel)
+    logToOutput(`[flow] Using current chat model ${chatModel?.id}`)
+  }
+  if (resumeFrom === 0) {
+    await saveFlowState({
+      flowId: flow.id,
+      status: 'running',
+      completedSteps: 0,
+      stepSummary,
+      originalPrompt: originalPromptContext,
+      startedAt,
+      updatedAt: new Date().toISOString(),
+    })
+  }
 
   for (let i = 0; i < flow.steps.length; i++) {
     if (token.isCancellationRequested) {
@@ -2682,7 +2809,7 @@ async function runFlow(
     const modelSpec = options.keepCurrentModel
       ? options.currentModelSpec
       : options.useChat
-        ? request.model?.id
+        ? chatModel?.id
         : step.model ?? agent.model
     const stepAgent: Agent = {
       ...agent,
@@ -2697,7 +2824,7 @@ async function runFlow(
       resolved = await getRegistry().resolve({
         flowStepModel: skipOverride ? undefined : modelSpec,
         agentModel: skipOverride ? undefined : agent.model,
-        sessionModel: request.model ? { providerId: 'vscode', modelId: request.model.id } : undefined,
+        sessionModel: chatModel ? { providerId: 'vscode', modelId: chatModel.id } : undefined,
         fallbackModel: getConfiguredFallbackModel(),
       })
     } catch (err) {
@@ -2722,45 +2849,53 @@ async function runFlow(
     logToOutput(`[flow] Step ${i + 1}: agent=${step.agent}, requested=${modelSpec ?? 'default'}, resolved=${resolved.provider.id}:${resolved.model.id} (${resolved.source})`)
 
     const release = await acquireLocalModel(resolved.model)
+    const stepStartedAtMs = Date.now()
+    const requiresPlanArtifact = stepRequiresPlanArtifact(step, agent)
     try {
       const messages = await buildMessages(chatContext, request, stepAgent, loaded)
       // Replace the last user message with the step instruction + prior summary
       const lastUser = messages[messages.length - 1]
       if (lastUser && lastUser.role === 'user') {
-        const textParts = lastUser.content.filter((p): p is RaptorTextPart => p.type === 'text')
-        const originalPrompt = textParts.map(p => p.value).join('')
         const budget = step.summaryBudget ?? 2000
         const summaryPrefix = stepSummary
           ? `[Previous steps summary (max ${budget} chars):\n${stepSummary.slice(0, budget)}\n]\n\n`
           : ''
-        const newContent = `${summaryPrefix}${step.instruction}\n\n[Original user request context: ${originalPrompt}]`
+        const originalContext = shouldAttachOriginalPrompt
+          ? `\n\n[Original user request context: ${originalPromptContext}]`
+          : ''
+        const newContent = `${summaryPrefix}${step.instruction}${originalContext}`
         messages[messages.length - 1] = { role: 'user', content: [{ type: 'text', value: newContent }] }
       }
 
       const allToolNames = getToolDefs().map(t => t.name)
       const allowedToolNames = filterToolsByAgent(allToolNames, stepAgent.tools)
       const requestedTools = getToolDefs().filter(t => allowedToolNames.includes(t.name))
-      const tools = resolved.provider.supportsTools(resolved.model) ? requestedTools : []
+      const modelSupportsTools = resolved.provider.supportsTools(resolved.model)
+      if (!modelSupportsTools && requestedTools.length > 0) {
+        throw new Error(toolCapabilityError(resolved.provider.id, resolved.model.id, requestedTools.length))
+      }
+      const tools = modelSupportsTools ? requestedTools : []
 
       let stepText = ''
       let iteration = 0
       let stepToolCalls = 0
       const maxIterations = getConfig().maxIterations
+      const thresholds = compactThresholdsForModel(resolved.model)
 
       const capNote = tools.length === 0 ? ' (text-only)' : ''
-      stream.progress(`raptor -> ${resolved.model.name} (${resolved.source}; step ${i + 1}${capNote})`)
+      stream.progress(`raptor -> ${resolved.model.name} (${resolved.source}; step ${i + 1}${contextWindowNote(resolved.model)}${capNote})`)
 
       while (iteration < maxIterations) {
         if (token.isCancellationRequested) break
         iteration++
 
         const tokenCount = estimateTokens(messages)
-        if (tokenCount > FULL_COMPACT_THRESHOLD) {
+        if (tokenCount > thresholds.full) {
           stream.progress(`Flow step ${i + 1} context full (${tokenCount.toLocaleString()} tokens) -- compacting...`)
           const compacted = await fullCompactMessages(messages, resolved, token)
           messages.length = 0
           messages.push(...compacted)
-        } else if (tokenCount > MICRO_COMPACT_THRESHOLD) {
+        } else if (tokenCount > thresholds.micro) {
           const compacted = microCompactMessages(messages)
           messages.length = 0
           messages.push(...compacted)
@@ -2806,6 +2941,22 @@ async function runFlow(
       if (!stepText.trim() && stepToolCalls === 0) {
         stream.markdown(`\n⚠️ Step ${i + 1} produced no output. Check the raptor Output channel for details. Continuing...`)
       }
+      if (stepToolCalls === 0 && looksLikeHallucinatedToolExecution(stepText)) {
+        throw new Error(
+          `Step ${i + 1} described tool results in text but made no real tool calls. ` +
+          'Flow aborted so fake edits/plans are not treated as completed work. Retry with a tool-capable model.',
+        )
+      }
+      if (requiresPlanArtifact) {
+        const planFile = await newestPlanFileSince(stepStartedAtMs)
+        if (!planFile) {
+          throw new Error(
+            `Planner step ${i + 1} did not create a real .plans/<slug>/plan.md file in the workspace. ` +
+            'Flow aborted so the implementer cannot invent fixes from prose-only planning.',
+          )
+        }
+        logToOutput(`[flow] Planner artifact created: ${shortenPath(planFile)}`)
+      }
 
       // Compact step output for next step summary
       const compact = stepText.trim().slice(0, step.summaryBudget ?? 2000)
@@ -2815,8 +2966,10 @@ async function runFlow(
       // Persist state after each step so --resume can pick up from here
       await saveFlowState({
         flowId: flow.id,
+        status: 'running',
         completedSteps: i + 1,
         stepSummary,
+        originalPrompt: originalPromptContext,
         startedAt,
         updatedAt: new Date().toISOString(),
       })
@@ -2830,7 +2983,15 @@ async function runFlow(
     }
   }
 
-  await deleteFlowState(flow.id)
+  await saveFlowState({
+    flowId: flow.id,
+    status: 'completed',
+    completedSteps: flow.steps.length,
+    stepSummary,
+    originalPrompt: originalPromptContext,
+    startedAt,
+    updatedAt: new Date().toISOString(),
+  })
   stream.markdown(`\n✅ Flow **${flow.name ?? flow.id}** completed.`)
   logToOutput(`[flow] "${flow.id}" completed`)
 }

@@ -41,11 +41,11 @@ export function createOpenAIProvider(config: OpenAIConfig): ModelProvider {
 
     async listModels(): Promise<RaptorModel[]> {
       return [
-        { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', providerId: 'openai' },
-        { id: 'gpt-5.2', name: 'GPT-5.2', providerId: 'openai' },
-        { id: 'gpt-4o', name: 'GPT-4o', providerId: 'openai' },
-        { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', providerId: 'openai' },
-        { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', providerId: 'openai' },
+        { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', providerId: 'openai', maxInputTokens: 400_000 },
+        { id: 'gpt-5.2', name: 'GPT-5.2', providerId: 'openai', maxInputTokens: 400_000 },
+        { id: 'gpt-4o', name: 'GPT-4o', providerId: 'openai', maxInputTokens: 128_000 },
+        { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', providerId: 'openai', maxInputTokens: 128_000 },
+        { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', providerId: 'openai', maxInputTokens: 16_385 },
       ]
     },
 

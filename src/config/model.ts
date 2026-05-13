@@ -42,7 +42,7 @@ export function normalizeModelSpec(spec: string): string {
 }
 
 function modelTokens(model: vscode.LanguageModelChat): string[] {
-  return [model.id, model.family, model.name].map(normalizeModelToken)
+  return [model.id, model.family, model.name].map(normalizeModelToken).filter(Boolean)
 }
 
 export function pickPreferredChatModel(
@@ -75,6 +75,17 @@ export function pickModelByVendorAndId(
   spec: string,
 ): vscode.LanguageModelChat | undefined {
   const norm = normalizeModelToken(spec)
+
+  const fullExact = models.find(model =>
+    modelTokens(model).some(value => value === norm),
+  )
+  if (fullExact) return fullExact
+
+  const fullPartial = models.find(model =>
+    modelTokens(model).some(value => value.includes(norm) || norm.includes(value)),
+  )
+  if (fullPartial) return fullPartial
+
   // Support vendor:model syntax, e.g. "ollama:llama3.1" or "openrouter:anthropic/claude-3.5-sonnet"
   const vendorSplit = norm.split(':')
   const vendorHint = vendorSplit.length > 1 ? vendorSplit[0] : undefined

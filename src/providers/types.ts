@@ -8,6 +8,8 @@ export interface RaptorModel {
   id: string
   name: string
   providerId: string
+  supportsTools?: boolean
+  maxInputTokens?: number
 }
 
 export interface RaptorTextPart {

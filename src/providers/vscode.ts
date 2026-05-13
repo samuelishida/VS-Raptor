@@ -7,10 +7,9 @@ import {
   type RaptorResponseEvent,
 } from './types'
 
-// Copilot LM API only allows request.model to produce responses within a handler
-// invocation. Models found via selectChatModels() lack the invocation's permission
-// context and silently return 0 chars. Store the handler's model here so sendRequest
-// can always use it instead of relying on a by-ID lookup.
+// Store the current handler's chat model so sendRequest uses the exact
+// LanguageModelChat object VS Code provided for this invocation. For /flow
+// --chat, this is the model selected in the user's chat picker.
 let activeSessionModel: vscode.LanguageModelChat | undefined
 
 export function setVSCodeSessionModel(model: vscode.LanguageModelChat | undefined): void {
@@ -30,6 +29,8 @@ export function createVSCodeProvider(): ModelProvider {
         id: m.id,
         name: m.name,
         providerId: 'vscode',
+        supportsTools: true,
+        maxInputTokens: m.maxInputTokens,
       }))
     },
 
@@ -59,8 +60,8 @@ export function createVSCodeProvider(): ModelProvider {
       }
     },
 
-    supportsTools(_model: RaptorModel): boolean {
-      return true
+    supportsTools(model: RaptorModel): boolean {
+      return model.supportsTools === true
     },
   }
 }

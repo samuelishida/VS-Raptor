@@ -10,7 +10,7 @@ Works as a **VS Code extension**, a **Claude Code plugin**, and an **npm-install
 - **Skill Router**: Built-in skills for fix-bug, plan, code-audit, refactor, review, and more
 - **Agent Flows**: Run multi-step flows that sequence different agents and models (VS Code only — see note below)
 - **Provider Switching**: Route to VS Code models, Anthropic, OpenAI, OpenRouter, Ollama, or CLI tools per agent or flow step
-- **Memory System**: Persistent global and project-scoped memory across sessions
+- **Memory System**: Persistent project-scoped memory by default, with explicit global memory when requested
 - **LSP Integration**: Go-to-definition, find references, and diagnostics
 - **Config Importers**: Reads `.claude`, `.codex`, and `.opencode` configs automatically
 
@@ -311,10 +311,10 @@ cat "$(npm root -g)/raptor/skills/fix-bug/SKILL.md"
 | `/flow <id>` | Run a multi-step flow |
 | `/models` | List providers, capability, and available models |
 | `/build-flow` | Design and generate an agent flow for this project |
-| `/memory` | Show persistent memory |
-| `/resume` | Load last session summary and continue |
-| `/todos` | Show current todo list |
-| `/clearmemory` | Wipe all persistent memory |
+| `/memory` | Show workspace project memory (`--global` includes user-wide memory) |
+| `/resume` | Load last workspace session summary and continue |
+| `/todos` | Show current workspace todo list |
+| `/clearmemory` | Clear workspace project memory (`--global` also clears user-wide memory) |
 | `/steer <msg>` | Inject guidance into a running agent |
 
 ---
@@ -416,6 +416,19 @@ By default only `vscode` and `ollama` are enabled. Enable others in settings:
 3. `<workspace>/.claude/`
 4. `<workspace>/.opencode/`
 5. `<workspace>/.raptor/` ← workspace-local, highest precedence
+
+### Workspace state
+
+Runtime state is workspace-scoped by default:
+
+- Project memory: `<workspace>/.raptor/MEMORY.md`
+- Session resume summary: `<workspace>/.raptor/last-session-summary.md`
+- Conversation history: `<workspace>/.raptor/history/`
+- Flow checkpoints: `<workspace>/.raptor/flow-state/`
+- Todos: `<workspace>/.raptor/todos.json`
+- Plans: `<workspace>/.plans/<slug>/plan.md`
+
+Global memory under `~/.raptor/memory/MEMORY.md` is only used when explicitly requested with `scope="global"` or `/memory --global`.
 
 ### Skills (`skills.md`)
 

@@ -41,11 +41,11 @@ export function createAnthropicProvider(config: AnthropicConfig): ModelProvider 
 
     async listModels(): Promise<RaptorModel[]> {
       return [
-        { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', providerId: 'anthropic' },
-        { id: 'claude-3-7-sonnet-20250219', name: 'Claude 3.7 Sonnet', providerId: 'anthropic' },
-        { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', providerId: 'anthropic' },
-        { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', providerId: 'anthropic' },
-        { id: 'claude-3-opus-20240229', name: 'Claude 3 Opus', providerId: 'anthropic' },
+        { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', providerId: 'anthropic', maxInputTokens: 200_000 },
+        { id: 'claude-3-7-sonnet-20250219', name: 'Claude 3.7 Sonnet', providerId: 'anthropic', maxInputTokens: 200_000 },
+        { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', providerId: 'anthropic', maxInputTokens: 200_000 },
+        { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', providerId: 'anthropic', maxInputTokens: 200_000 },
+        { id: 'claude-3-opus-20240229', name: 'Claude 3 Opus', providerId: 'anthropic', maxInputTokens: 200_000 },
       ]
     },
 

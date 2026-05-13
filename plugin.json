@@ -9,6 +9,21 @@
   "author": {
     "name": "Samuel Ishida"
   },
+  "license": "MIT",
+  "interface": {
+    "displayName": "Raptor",
+    "shortDescription": "Route coding work through specialist skills and build agent flows.",
+    "longDescription": "Raptor provides an orchestration skill, coding workflow skills, review and planning specialists, and an agent-flow builder for custom automations.",
+    "developerName": "Samuel Ishida",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Route this coding task through the right skill.",
+      "Build a Raptor agent flow for this project.",
+      "Review this change and find runtime risks."
+    ],
+    "brandColor": "#2563EB"
+  },
   "engines": {
     "claude-code": ">=1.0.0"
   }

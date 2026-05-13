@@ -29,7 +29,7 @@ function parseModelSpec(spec: string): { provider?: string; model: string; raw: 
 }
 
 function modelTokens(model: RaptorModel): string[] {
-  return [model.id, model.name].map(normalizeToken)
+  return [model.id, model.name].map(normalizeToken).filter(Boolean)
 }
 
 function pickModelByVendorAndId(
@@ -42,6 +42,13 @@ function pickModelByVendorAndId(
   }
 
   const norm = normalizeToken(spec)
+
+  const fullExact = models.find(m => modelTokens(m).some(v => v === norm))
+  if (fullExact) return fullExact
+
+  const fullPartial = models.find(m => modelTokens(m).some(v => v.includes(norm) || norm.includes(v)))
+  if (fullPartial) return fullPartial
+
   const vendorSplit = norm.split(':')
   const vendorHint = vendorSplit.length > 1 ? vendorSplit[0] : undefined
   const modelHint = vendorSplit.length > 1 ? vendorSplit.slice(1).join(':') : norm

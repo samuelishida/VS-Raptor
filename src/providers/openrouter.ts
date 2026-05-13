@@ -40,13 +40,31 @@ export function createOpenRouterProvider(config: OpenRouterConfig): ModelProvide
     acceptsArbitraryModel: false,
 
     async listModels(): Promise<RaptorModel[]> {
+      try {
+        const response = await fetch(`${baseUrl}/models`, {
+          headers: { 'Authorization': `Bearer ${apiKey}` },
+        })
+        if (response.ok) {
+          const data = await response.json() as {
+            data?: Array<{ id: string; name?: string; context_length?: number }>
+          }
+          const models = data.data?.map(m => ({
+            id: m.id,
+            name: m.name ?? m.id,
+            providerId: 'openrouter',
+            maxInputTokens: typeof m.context_length === 'number' ? m.context_length : undefined,
+          })) ?? []
+          if (models.length > 0) return models
+        }
+      } catch { /* fall back to static list */ }
+
       return [
-        { id: 'anthropic/claude-3.5-sonnet', name: 'Claude 3.5 Sonnet', providerId: 'openrouter' },
-        { id: 'anthropic/claude-3-opus', name: 'Claude 3 Opus', providerId: 'openrouter' },
-        { id: 'openai/gpt-4-turbo', name: 'GPT-4 Turbo', providerId: 'openrouter' },
-        { id: 'openai/gpt-4o', name: 'GPT-4o', providerId: 'openrouter' },
-        { id: 'google/gemini-pro-1.5', name: 'Gemini Pro 1.5', providerId: 'openrouter' },
-        { id: 'meta-llama/llama-3-70b-instruct', name: 'Llama 3 70B', providerId: 'openrouter' },
+        { id: 'anthropic/claude-3.5-sonnet', name: 'Claude 3.5 Sonnet', providerId: 'openrouter', maxInputTokens: 200_000 },
+        { id: 'anthropic/claude-3-opus', name: 'Claude 3 Opus', providerId: 'openrouter', maxInputTokens: 200_000 },
+        { id: 'openai/gpt-4-turbo', name: 'GPT-4 Turbo', providerId: 'openrouter', maxInputTokens: 128_000 },
+        { id: 'openai/gpt-4o', name: 'GPT-4o', providerId: 'openrouter', maxInputTokens: 128_000 },
+        { id: 'google/gemini-pro-1.5', name: 'Gemini Pro 1.5', providerId: 'openrouter', maxInputTokens: 1_000_000 },
+        { id: 'meta-llama/llama-3-70b-instruct', name: 'Llama 3 70B', providerId: 'openrouter', maxInputTokens: 8_192 },
       ]
     },
 

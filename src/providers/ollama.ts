@@ -25,11 +25,12 @@ export function createOllamaProvider(config: OllamaConfig): ModelProvider {
         const response = await fetch(`${baseUrl}/api/tags`)
         if (!response.ok) return []
         const data = await response.json() as { models: Array<{ name: string; model: string }> }
-        return data.models.map(m => ({
+        return await Promise.all(data.models.map(async m => ({
           id: m.name,
           name: m.name,
           providerId: 'ollama',
-        }))
+          maxInputTokens: await getOllamaContextLength(baseUrl, m.name),
+        })))
       } catch {
         return []
       }
@@ -63,6 +64,30 @@ export function createOllamaProvider(config: OllamaConfig): ModelProvider {
     },
 
     supportsTools() { return true },
+  }
+}
+
+async function getOllamaContextLength(baseUrl: string, model: string): Promise<number | undefined> {
+  try {
+    const response = await fetch(`${baseUrl}/api/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    })
+    if (!response.ok) return undefined
+    const data = await response.json() as {
+      parameters?: string
+      model_info?: Record<string, unknown>
+    }
+
+    const numCtxMatch = data.parameters?.match(/(?:^|\n)\s*num_ctx\s+(\d+)/i)
+    if (numCtxMatch) return Number(numCtxMatch[1])
+
+    const contextEntry = Object.entries(data.model_info ?? {})
+      .find(([key, value]) => key.endsWith('.context_length') && typeof value === 'number')
+    return typeof contextEntry?.[1] === 'number' ? contextEntry[1] : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -129,6 +154,9 @@ function buildRequestBody(
     model: model.id,
     messages: ollamaMessages,
     stream: true,
+  }
+  if (model.maxInputTokens) {
+    body.options = { num_ctx: model.maxInputTokens }
   }
 
   if (tools && tools.length > 0) {
