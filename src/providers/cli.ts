@@ -2,6 +2,7 @@ import * as vscode from 'vscode'
 import * as os from 'os'
 import * as path from 'path'
 import { spawn } from 'child_process'
+import { StringDecoder } from 'string_decoder'
 import {
   ProviderError,
   type ModelProvider,
@@ -30,6 +31,7 @@ export interface CliProviderRuntimeConfig {
 }
 
 const WIN_ARGV_SAFE_LIMIT = 8000
+const RESOLVE_COMMAND_TIMEOUT_MS = 5000
 
 function unquoteCommand(cmd: string): string {
   const trimmed = cmd.trim()
@@ -48,7 +50,7 @@ export async function resolveCommand(cmd: string): Promise<{ ok: true; command: 
   }
 
   const trimmed = unquoteCommand(cmd)
-  
+
   if (path.isAbsolute(trimmed)) {
     try {
       await vscode.workspace.fs.stat(vscode.Uri.file(trimmed))
@@ -59,25 +61,36 @@ export async function resolveCommand(cmd: string): Promise<{ ok: true; command: 
   }
 
   const whichCmd = process.platform === 'win32' ? 'where.exe' : 'which'
-  const result = await new Promise<string>((resolve, reject) => {
-    const child = spawn(whichCmd, [trimmed], {
-      shell: false,
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
+  try {
+    const result = await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Command resolution timed out: ${trimmed}`)),
+        RESOLVE_COMMAND_TIMEOUT_MS,
+      )
+      const child = spawn(whichCmd, [trimmed], {
+        shell: false,
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      child.stdout.on('data', (d) => { stdout += d.toString('utf-8') })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        if (code === 0 && stdout.trim()) {
+          resolve(stdout.trim().split(/\r?\n/)[0])
+        } else {
+          reject(new Error(`Command not found: ${trimmed}`))
+        }
+      })
+      child.on('error', (err) => {
+        clearTimeout(timer)
+        reject(err)
+      })
     })
-    let stdout = ''
-    child.stdout.on('data', (d) => { stdout += d.toString('utf-8') })
-    child.on('close', (code) => {
-      if (code === 0 && stdout.trim()) {
-        resolve(stdout.trim().split(/\r?\n/)[0])
-      } else {
-        reject(new Error(`Command not found: ${trimmed}`))
-      }
-    })
-    child.on('error', reject)
-  })
-
-  return { ok: true, command: result }
+    return { ok: true, command: result }
+  } catch (err) {
+    return { ok: false, reason: String(err) }
+  }
 }
 
 function textFromMessage(message: RaptorMessage): string {
@@ -130,19 +143,20 @@ export function createCliProvider(
     providerId: definition.id,
   }))
 
-  let commandResolved: { ok: true; command: string } | { ok: false; reason: string } | null = null
-  let statusChecked = false
+  // Promise-based caching: concurrent callers await the same resolution, no duplicate spawns.
+  let commandResolvedPromise: Promise<{ ok: true; command: string } | { ok: false; reason: string }> | null = null
+
+  async function getResolvedCommand() {
+    if (!commandResolvedPromise) {
+      commandResolvedPromise = resolveCommand(runtimeCommand)
+    }
+    return commandResolvedPromise
+  }
 
   async function checkStatus(): Promise<ProviderStatus> {
-    if (!statusChecked) {
-      commandResolved = await resolveCommand(runtimeCommand)
-      statusChecked = true
-    }
-    if (!commandResolved) {
-      commandResolved = await resolveCommand(runtimeCommand)
-    }
-    if (!commandResolved.ok) {
-      return { available: false, reason: commandResolved.reason, code: 'command-not-found' }
+    const result = await getResolvedCommand()
+    if (!result.ok) {
+      return { available: false, reason: result.reason, code: 'command-not-found' }
     }
     return { available: true }
   }
@@ -182,9 +196,9 @@ export function createCliProvider(
       _options: { tools?: vscode.LanguageModelChatTool[] },
       token: vscode.CancellationToken,
     ): Promise<AsyncIterable<RaptorResponseEvent>> {
-      const status = await checkStatus()
-      if (!status.available) {
-        throw new ProviderError(definition.id, status.code || 'unavailable', status.reason || 'Command not available')
+      const resolved = await getResolvedCommand()
+      if (!resolved.ok) {
+        throw new ProviderError(definition.id, 'command-not-found', resolved.reason)
       }
 
       const lastUserMessage = [...messages].reverse().find(m => m.role === 'user')
@@ -202,12 +216,8 @@ export function createCliProvider(
       const cwd = getCwd(definition.cwdPolicy)
       const env = buildEnv(definition.envKeys, config)
 
-      if (!commandResolved || !commandResolved.ok) {
-        throw new ProviderError(definition.id, 'command-not-found', 'Command not resolved')
-      }
-
       return streamCliCommand(
-        commandResolved.command,
+        resolved.command,
         args,
         cwd,
         env,
@@ -235,8 +245,6 @@ function getCwd(policy: CliProviderDefinition['cwdPolicy']): string {
 
 function buildEnv(keys: string[] = [], config: CliProviderRuntimeConfig = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env }
-  // If an API key was configured via SecretStorage or settings, inject it as the
-  // provider's primary env var (first entry in envKeys, e.g. ANTHROPIC_API_KEY).
   if (config.apiKey && keys.length > 0) {
     env[keys[0]] = config.apiKey
   }
@@ -263,40 +271,43 @@ async function* streamCliCommand(
 
   if (promptTransport === 'stdin') {
     if (child.stdin) {
-      child.stdin.on('error', () => { /* ignore */ })
+      child.stdin.on('error', () => { /* ignore broken pipe on early exit */ })
       child.stdin.write(promptText)
       child.stdin.end()
     }
   }
 
   const stdoutQueue: string[] = []
+  let stderrBuffer = ''
   let done = false
   let exitCode: number | null = null
   let error: Error | null = null
 
   const cancelHandler = () => {
-    try {
-      child.kill('SIGTERM')
-    } catch { /* */ }
-    setTimeout(() => {
-      try { child.kill('SIGKILL') } catch { /* */ }
-    }, 2000)
+    try { child.kill('SIGTERM') } catch { /* */ }
+    setTimeout(() => { try { child.kill('SIGKILL') } catch { /* */ } }, 2000)
   }
-  token.onCancellationRequested(cancelHandler)
+  const cancelDisposable = token.onCancellationRequested(cancelHandler)
+
+  const stdoutDecoder = new StringDecoder('utf8')
+  const stderrDecoder = new StringDecoder('utf8')
 
   if (child.stdout) {
     child.stdout.on('data', (chunk: Buffer) => {
-      stdoutQueue.push(chunk.toString('utf-8'))
+      stdoutQueue.push(stdoutDecoder.write(chunk))
     })
   }
 
   if (child.stderr) {
     child.stderr.on('data', (chunk: Buffer) => {
-      stdoutQueue.push(`[stderr] ${chunk.toString('utf-8')}`)
+      stderrBuffer += stderrDecoder.write(chunk)
     })
   }
 
   child.on('close', (code) => {
+    const remaining = stdoutDecoder.end()
+    if (remaining) stdoutQueue.push(remaining)
+    stderrBuffer += stderrDecoder.end()
     done = true
     exitCode = code
   })
@@ -306,24 +317,29 @@ async function* streamCliCommand(
     error = err
   })
 
-  while (!done) {
+  try {
+    while (!done) {
+      while (stdoutQueue.length > 0) {
+        const chunk = stdoutQueue.shift()!
+        yield { type: 'text', value: chunk }
+      }
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+
     while (stdoutQueue.length > 0) {
       const chunk = stdoutQueue.shift()!
       yield { type: 'text', value: chunk }
     }
-    await new Promise(resolve => setTimeout(resolve, 50))
-  }
-
-  while (stdoutQueue.length > 0) {
-    const chunk = stdoutQueue.shift()!
-    yield { type: 'text', value: chunk }
+  } finally {
+    cancelDisposable.dispose()
   }
 
   if (error) {
     throw new ProviderError(providerId, 'spawn-error', String(error))
   }
   if (exitCode !== 0 && exitCode !== null) {
-    throw new ProviderError(providerId, `exit-${exitCode}`, `CLI exited with code ${exitCode}`)
+    const stderrHint = stderrBuffer.trim() ? `\nstderr: ${stderrBuffer.trim().slice(0, 500)}` : ''
+    throw new ProviderError(providerId, `exit-${exitCode}`, `CLI exited with code ${exitCode}${stderrHint}`)
   }
 }
 
@@ -343,7 +359,7 @@ export function createClaudeCodeProviderConfig(): CliProviderDefinition {
     id: 'claude-code',
     name: 'Claude Code (CLI)',
     command: 'claude',
-    argsForModel: (model, prompt) => {
+    argsForModel: (model, _prompt) => {
       if (model.id && model.id !== 'default') {
         return ['--print', '--input-format', 'text', '--model', model.id]
       }
@@ -362,13 +378,13 @@ export function createCodexProviderConfig(): CliProviderDefinition {
     id: 'codex',
     name: 'Codex CLI',
     command: 'codex',
-    argsForModel: (model, prompt) => {
-      const modelId = (model.id && model.id !== 'default') ? model.id : 'gpt-5.3-codex'
+    argsForModel: (model, _prompt) => {
+      const modelId = (model.id && model.id !== 'default') ? model.id : 'codex-mini-latest'
       return ['exec', '--model', modelId, '-']
     },
     cwdPolicy: 'workspace',
     envKeys: ['OPENAI_API_KEY'],
-    knownModels: ['gpt-5.3-codex', 'gpt-5.2'],
+    knownModels: ['codex-mini-latest', 'o4-mini'],
     acceptsArbitraryModel: true,
     promptTransport: 'stdin',
   }

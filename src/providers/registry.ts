@@ -35,10 +35,11 @@ function modelTokens(model: RaptorModel): string[] {
 function pickModelByVendorAndId(
   models: readonly RaptorModel[],
   spec: string,
-): RaptorModel | undefined {
+  providerId?: string,
+): RaptorModel {
   if (models.length === 0) {
     console.warn('[Model Registry] Empty models array passed to pickModelByVendorAndId')
-    return undefined
+    throw new ProviderError(providerId ?? 'registry', 'no-models', 'No models available to select from.')
   }
 
   const norm = normalizeToken(spec)
@@ -62,7 +63,12 @@ function pickModelByVendorAndId(
   const partial = candidates.find(m => modelTokens(m).some(v => v.includes(modelHint)))
   if (partial) return partial
 
-  return undefined
+  const availableList = models.map(m => m.id).join(', ')
+  throw new ProviderError(
+    providerId ?? 'registry',
+    'model-not-found',
+    `Model "${spec}" not found. Available: ${availableList || '(none)'}.`,
+  )
 }
 
 function resolveExplicitProviderModel(
@@ -73,12 +79,14 @@ function resolveExplicitProviderModel(
 ): RaptorModel {
   const parsed = parseModelSpec(spec)
   const modelHint = parsed.model
-  const picked = pickModelByVendorAndId(available, spec)
-  if (picked) return picked
-  if (provider.acceptsArbitraryModel) {
-    return { id: modelHint, name: modelHint, providerId }
+  try {
+    return pickModelByVendorAndId(available, spec, providerId)
+  } catch (err) {
+    if (provider.acceptsArbitraryModel) {
+      return { id: modelHint, name: modelHint, providerId }
+    }
+    throw err
   }
-  throw new ProviderError(providerId, 'model-not-found', `Model "${modelHint}" not found in provider "${provider.name}".`)
 }
 
 async function ensureProviderAvailable(provider: ModelProvider): Promise<void> {
@@ -121,8 +129,10 @@ async function resolveInternal(
     for (const p of providers.values()) {
       if (p.capability === 'unavailable') continue
       const available = await p.listModels()
-      const picked = pickModelByVendorAndId(available, input.flowStepModel)
-      if (picked) return { provider: p, model: picked, source: 'flow-step-override', available }
+      try {
+        const picked = pickModelByVendorAndId(available, input.flowStepModel, p.id)
+        return { provider: p, model: picked, source: 'flow-step-override', available }
+      } catch { /* try next provider */ }
     }
     throw new ProviderError('registry', 'model-not-found', `Flow step model "${input.flowStepModel}" was not found in any provider.`)
   }
@@ -156,8 +166,10 @@ async function resolveInternal(
     for (const p of providers.values()) {
       if (p.capability === 'unavailable') continue
       const available = await p.listModels()
-      const picked = pickModelByVendorAndId(available, input.agentModel)
-      if (picked) return { provider: p, model: picked, source: 'agent-override', available }
+      try {
+        const picked = pickModelByVendorAndId(available, input.agentModel, p.id)
+        return { provider: p, model: picked, source: 'agent-override', available }
+      } catch { /* try next provider */ }
     }
     throw new ProviderError('registry', 'model-not-found', `Agent model "${input.agentModel}" was not found in any provider.`)
   }
@@ -169,16 +181,20 @@ async function resolveInternal(
       const provider = providers.get(sessionProviderId)
       if (provider && provider.capability !== 'unavailable') {
         const available = await provider.listModels()
-        const picked = pickModelByVendorAndId(available, input.sessionModel.modelId)
-        if (picked) return { provider, model: picked, source: 'session-selected', available }
+        try {
+          const picked = pickModelByVendorAndId(available, input.sessionModel.modelId, sessionProviderId)
+          return { provider, model: picked, source: 'session-selected', available }
+        } catch { /* fall through to fallback */ }
       }
     }
     for (const p of providers.values()) {
       if (p.capability === 'unavailable') continue
       const available = await p.listModels()
       if (available.length > 0) {
-        const picked = pickModelByVendorAndId(available, input.sessionModel.modelId)
-        if (picked) return { provider: p, model: picked, source: 'session-selected', available }
+        try {
+          const picked = pickModelByVendorAndId(available, input.sessionModel.modelId, p.id)
+          return { provider: p, model: picked, source: 'session-selected', available }
+        } catch { /* try next provider */ }
       }
     }
   }
@@ -241,4 +257,3 @@ export function createProviderRegistry(context: vscode.ExtensionContext): Provid
   }
 }
 
-export { parseModelSpec }

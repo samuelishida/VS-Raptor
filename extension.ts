@@ -295,7 +295,9 @@ async function getOrBuildWorkspaceProfile(): Promise<string> {
   try {
     await fs.mkdir(pDir, { recursive: true })
     await fs.writeFile(profilePath, result, 'utf-8')
-  } catch { /* silent */ }
+  } catch (err) {
+    logToOutput(`[profile] Failed to cache workspace profile: ${String(err)}`)
+  }
 
   return result
 }
@@ -431,7 +433,9 @@ async function saveSessionSummary(summary: string): Promise<void> {
     const p = sessionSummaryPath()
     await fs.mkdir(path.dirname(p), { recursive: true })
     await fs.writeFile(p, summary, 'utf-8')
-  } catch { /* silent */ }
+  } catch (err) {
+    logToOutput(`[session] Failed to save session summary: ${String(err)}`)
+  }
 }
 
 async function loadSessionSummary(): Promise<string | null> {
@@ -480,7 +484,9 @@ async function saveConversationHistory(
 
     const filename = `session-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
     await fs.writeFile(path.join(hDir, filename), JSON.stringify(snapshot, null, 2), 'utf-8')
-  } catch { /* silent */ }
+  } catch (err) {
+    logToOutput(`[history] Failed to save conversation history: ${String(err)}`)
+  }
 }
 
 async function loadRecentHistory(): Promise<ConversationSnapshot | null> {
@@ -602,7 +608,9 @@ async function extractAndStoreMemories(
       pMem = pMem ? pMem.trimEnd() + '\n\n' + block : block
       await writeProjectMemory(pMem)
     }
-  } catch { /* fire-and-forget */ }
+  } catch (err) {
+    logToOutput(`[memory] Failed to extract memories: ${String(err)}`)
+  }
 }
 
 // ─── Activation ───────────────────────────────────────────────────────────────
@@ -1999,9 +2007,9 @@ async function handleChatRequest(
     const clearGlobal = /\s--global(?:\s|$)/.test(promptTrimmed) || /\s--all(?:\s|$)/.test(promptTrimmed)
     const cleared: string[] = []
     const pm = projectMemoryPath()
-    if (pm) { try { await fs.unlink(pm); cleared.push('project') } catch { /* */ } }
+    if (pm) { try { await fs.unlink(pm); cleared.push('project') } catch (err) { logToOutput(`[clearmemory] Failed to delete project memory: ${err}`) } }
     if (clearGlobal) {
-      try { await fs.unlink(memoryIndexPath()); cleared.push('global') } catch { /* */ }
+      try { await fs.unlink(memoryIndexPath()); cleared.push('global') } catch (err) { logToOutput(`[clearmemory] Failed to delete global memory: ${err}`) }
     }
     stream.markdown(cleared.length > 0 ? `Cleared: ${cleared.join(', ')} memory.` : 'No memory to clear.')
     return {}
@@ -2129,6 +2137,10 @@ async function handleChatRequest(
     const allowModelChanges = flowParts.includes('--accept-models')
     const keepCurrentModel = flowParts.includes('--keep-current')
     const useChat = flowParts.includes('--chat')
+    const chatIdx = flowParts.indexOf('--chat')
+    const chatModelArg = useChat && chatIdx + 1 < flowParts.length && !flowParts[chatIdx + 1].startsWith('--')
+      ? flowParts[chatIdx + 1]
+      : undefined
     const doResume = flowParts.includes('--resume')
     const doMemory = flowParts.includes('--memory')
 
@@ -2239,6 +2251,7 @@ async function handleChatRequest(
       allowModelChanges,
       keepCurrentModel,
       useChat,
+      chatModel: chatModelArg,
       currentModelSpec,
       resumeFromStep,
       resumedSummary,
@@ -2617,7 +2630,9 @@ async function saveFlowState(state: FlowState): Promise<void> {
   try {
     await fs.mkdir(flowStateDir(), { recursive: true })
     await fs.writeFile(flowStatePath(state.flowId), JSON.stringify(state, null, 2), 'utf-8')
-  } catch { /* non-fatal */ }
+  } catch (err) {
+    logToOutput(`[flow-state] Failed to save flow state for "${state.flowId}": ${String(err)}`)
+  }
 }
 
 async function loadFlowState(flowId: string): Promise<FlowState | null> {
@@ -2646,6 +2661,7 @@ interface FlowRunOptions {
   allowModelChanges?: boolean
   keepCurrentModel?: boolean
   useChat?: boolean
+  chatModel?: string
   currentModelSpec?: string
   resumeFromStep?: number
   resumedSummary?: string
@@ -2772,13 +2788,22 @@ async function runFlow(
   const originalPromptContext = options.originalPrompt?.trim()
   const shouldAttachOriginalPrompt = !!originalPromptContext && !isFlowCommandPrompt(originalPromptContext)
   let chatModel: vscode.LanguageModelChat | undefined = request.model
+  if (options.useChat && options.chatModel) {
+    const allModels = await vscode.lm.selectChatModels()
+    const found = allModels.find(m => m.id === options.chatModel || m.id.includes(options.chatModel!))
+    if (!found) {
+      stream.markdown(`\n❌ Model \`${options.chatModel}\` not found. Available: ${allModels.map(m => `\`${m.id}\``).join(', ')}\n`)
+      return
+    }
+    chatModel = found
+  }
   if (options.useChat && !chatModel) {
     stream.markdown(`\n❌ No current chat model was provided by VS Code for \`--chat\`. Select a model in the chat picker and retry \`/flow ${flow.id} --chat\`.\n`)
     return
   }
   if (options.useChat) {
     setVSCodeSessionModel(chatModel)
-    logToOutput(`[flow] Using current chat model ${chatModel?.id}`)
+    logToOutput(`[flow] Using chat model ${chatModel?.id}`)
   }
   if (resumeFrom === 0) {
     await saveFlowState({
@@ -2872,7 +2897,7 @@ async function runFlow(
       const requestedTools = getToolDefs().filter(t => allowedToolNames.includes(t.name))
       const modelSupportsTools = resolved.provider.supportsTools(resolved.model)
       if (!modelSupportsTools && requestedTools.length > 0) {
-        throw new Error(toolCapabilityError(resolved.provider.id, resolved.model.id, requestedTools.length))
+        logToOutput(`[flow] ${resolved.provider.id}:${resolved.model.id} does not support tools; running step ${i + 1} text-only`)
       }
       const tools = modelSupportsTools ? requestedTools : []
 

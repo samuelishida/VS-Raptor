@@ -11,9 +11,7 @@ tsconfig.json
 *.vsix
 .plans/**
 .raptor/**
-.codex-plugin/**
 .claude-plugin/**
 agents/**
 skills/**
 .agents/**
-plugin.json

@@ -1,5 +1,5 @@
 # Workspace Profile
-Generated: 2026-05-12T06:28:30.385Z
+Generated: 2026-05-13T10:23:44.632Z
 
 ## Node.js Project
 - Name: raptor
@@ -9,9 +9,9 @@ Generated: 2026-05-12T06:28:30.385Z
 
 ## TypeScript Config
 - Target: ES2020
-- Module: CommonJS
+- Module: Node16
 - Strict: true
 
 ## Workspace Structure
 Dirs: dist/, node_modules/, src/, skills/, agents/
-Files: package-lock.json, tsconfig.json, .gitignore, raptor-vscode-extension-0.2.0.vsix, plugin.json, .vscodeignore, package.json, README.md, extension.ts
+Files: package-lock.json, tsconfig.json, .gitignore, raptor-vscode-extension-0.2.0.vsix, plugin.json, .vscodeignore, README.md, package.json, extension.ts, raptor-0.2.0.vsix

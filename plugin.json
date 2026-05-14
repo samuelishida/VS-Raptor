@@ -2,7 +2,7 @@
   "name": "raptor",
   "displayName": "Raptor",
   "version": "0.2.0",
-  "description": "Agent orchestrator with specialist skills for coding workflows — plan, audit, fix bugs, refactor, review PRs, and build custom agent flows.",
+  "description": "Agent orchestrator that routes coding tasks to specialist skills, builds custom agent flows, and runs multi-step automations.",
   "keywords": ["coding", "agent", "orchestrator", "workflow", "audit", "review", "planning"],
   "skills": "./skills",
   "agents": "./agents",
@@ -10,6 +10,8 @@
     "name": "Samuel Ishida"
   },
   "license": "MIT",
+  "homepage": "https://github.com/samuelishida/raptor",
+  "repository": "https://github.com/samuelishida/raptor",
   "interface": {
     "displayName": "Raptor",
     "shortDescription": "Route coding work through specialist skills and build agent flows.",

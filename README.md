@@ -2,7 +2,7 @@
 
 Agent orchestrator that routes tasks to specialist skills, builds custom agent flows, and runs multi-step automations.
 
-Works as a **VS Code extension**, a **Claude Code plugin**, and an **npm-installable skill pack** for any AI coding tool.
+Works as a **VS Code extension**, a **Claude Code plugin**, and a **skill pack** for Codex CLI, OpenCode, and any AI coding tool that accepts a system prompt or instructions file.
 
 ## Features
 
@@ -18,57 +18,79 @@ Works as a **VS Code extension**, a **Claude Code plugin**, and an **npm-install
 
 ## Installation
 
-### VS Code extension
-
-**Option A — install from VSIX:**
+All non-VS-Code targets share a single source directory. Get it once:
 
 ```bash
-# Build the VSIX first
-npm install
-npm run compile
-npx vsce package --no-dependencies
-
-# Install
-code --install-extension raptor-0.2.0.vsix
+git clone https://github.com/samuelishida/raptor.git
+# or
+npm install -g @samuelishida/raptor    # exposes $(npm root -g)/@samuelishida/raptor
 ```
 
-Or manually: Extensions panel → `...` → Install from VSIX → select the `.vsix` file.
-
-**Option B — install from source (dev mode):**
+Set `RAPTOR_DIR` to that path so the snippets below stay copy-paste safe:
 
 ```bash
-git clone <repo>
+export RAPTOR_DIR="/path/to/raptor"           # if cloned
+# or
+export RAPTOR_DIR="$(npm root -g)/@samuelishida/raptor"
+```
+
+---
+
+### VS Code extension
+
+**Marketplace (once published):**
+
+Open the Extensions panel → search `Raptor` by Samuel Ishida → Install.
+
+Or from the command line:
+
+```bash
+code --install-extension samuelishida.raptor
+```
+
+**Install from VSIX (local build):**
+
+```bash
+git clone https://github.com/samuelishida/raptor.git
 cd raptor
 npm install
 npm run compile
-# Press F5 in VS Code to launch Extension Development Host
+npx vsce package --no-dependencies
+code --install-extension raptor-0.2.0.vsix
+```
+
+**Dev mode:**
+
+```bash
+# Press F5 in VS Code (with the cloned repo open) to launch Extension Development Host.
 ```
 
 ---
 
 ### Claude Code plugin
 
-Raptor ships a `plugin.json` that Claude Code recognizes as a plugin.
+Raptor's `.claude-plugin/plugin.json` plus the `skills/` and `agents/` directories make the repo a self-contained Claude Code plugin. Skills are namespaced as `/raptor:<skill>` (e.g. `/raptor:fix-bug`).
 
-**Install from npm (once published):**
-
-```bash
-npm install -g raptor
-```
-
-Claude Code discovers plugins in global `node_modules` by scanning for `plugin.json` with `engines.claude-code`.
-
-**Install from local path (development):**
+**Load directly from a local path (dev or single-machine use):**
 
 ```bash
-claude plugin install /path/to/raptor
+claude --plugin-dir "$RAPTOR_DIR"
 ```
 
-This loads `skills/` and `agents/` into Claude Code's skill/agent system, making all Raptor skills available as `/` slash commands.
+**Install via a marketplace (sharing across machines/teams):**
 
-**Available after install:**
+1. Add Raptor's git repo as a marketplace source:
+   ```bash
+   /plugin marketplace add samuelishida/raptor
+   ```
+2. Install the plugin:
+   ```bash
+   /plugin install raptor@samuelishida/raptor
+   ```
 
-| Skill | Trigger |
+**Available after install (all namespaced under `/raptor:`):**
+
+| Skill | Description |
 |---|---|
 | `raptor` | Master router — identifies intent and delegates |
 | `agent-flow-builder` | Design and generate `.raptor/agents.json` + `flows.json` |
@@ -79,218 +101,104 @@ This loads `skills/` and `agents/` into Claude Code's skill/agent system, making
 | `review-large-pr` | Chunked PR review for 30+ file changes |
 | and more... | See `skills/` directory |
 
-> **Note:** The `agent-flow-builder` skill generates `.raptor/agents.json` and `flows.json` config files in any tool. The multi-step flow *runner* (`/flow <id>` with model-per-step switching and between-step confirmations) is VS Code only. In Claude Code and other CLI tools, flows are executed conversationally by the AI following the skill process.
-
----
-
-### Cursor
-
-Cursor supports custom rules and system prompt injection via `.cursor/rules/`.
-
-```bash
-npm install -g raptor
-```
-
-Create `.cursor/rules/raptor.mdc`:
-
-```markdown
----
-description: Raptor orchestrator — route all coding tasks through the right specialist skill
-alwaysApply: true
----
-
-{{{ file NODE_MODULES_PATH/raptor/agents/raptor.md }}}
-```
-
-Or copy the skill files directly:
-
-```bash
-mkdir -p .cursor/rules
-cp "$(npm root -g)/raptor/agents/raptor.md" .cursor/rules/raptor.mdc
-```
-
-For individual skills, copy specific `skills/<name>/SKILL.md` files as additional rule files.
-
----
-
-### Windsurf
-
-Windsurf uses `.windsurf/rules/` for global and workspace rules.
-
-```bash
-npm install -g raptor
-```
-
-Copy the orchestrator into your workspace rules:
-
-```bash
-mkdir -p .windsurf/rules
-cp "$(npm root -g)/raptor/agents/raptor.md" .windsurf/rules/raptor.md
-```
-
-Or reference individual skills:
-
-```bash
-cp "$(npm root -g)/raptor/skills/fix-bug/SKILL.md" .windsurf/rules/fix-bug.md
-cp "$(npm root -g)/raptor/skills/code-audit/SKILL.md" .windsurf/rules/code-audit.md
-```
-
----
-
-### Cline / Roo Code
-
-Cline and Roo Code support custom instructions via `.clinerules` (workspace) or global settings.
-
-```bash
-npm install -g raptor
-```
-
-**Workspace rules** — create `.clinerules`:
-
-```bash
-cat "$(npm root -g)/raptor/agents/raptor.md" > .clinerules
-```
-
-**Custom modes (Roo Code)** — add a `raptor` mode in Roo Code settings, pasting the contents of `agents/raptor.md` as the system prompt.
-
----
-
-### Continue.dev
-
-Continue supports context providers and system prompt injection via `~/.continue/config.json`.
-
-```bash
-npm install -g raptor
-```
-
-Add to `~/.continue/config.json`:
-
-```json
-{
-  "systemMessage": "$(cat $(npm root -g)/raptor/agents/raptor.md)"
-}
-```
-
-Or statically paste the contents of `agents/raptor.md` into the `systemMessage` field.
-
-For skill-specific contexts, use Continue's `@file` context provider pointing at individual skill files:
-
-```
-@file ~/.../node_modules/raptor/skills/fix-bug/SKILL.md Fix this bug.
-```
-
----
-
-### Aider
-
-Aider supports custom instructions via `--system-prompt` or `.aider.conf.yml`.
-
-```bash
-npm install -g raptor
-```
-
-**One-off:**
-
-```bash
-aider --system-prompt "$(cat $(npm root -g)/raptor/agents/raptor.md)"
-```
-
-**Persistent** — add to `.aider.conf.yml` in your project or `~/.aider.conf.yml`:
-
-```yaml
-system-prompt: /path/to/node_modules/raptor/agents/raptor.md
-```
-
-For skill-specific workflows:
-
-```bash
-aider --system-prompt "$(cat $(npm root -g)/raptor/skills/fix-bug/SKILL.md)"
-```
-
----
-
-### Gemini CLI
-
-Gemini CLI supports system instructions via `--system-instruction` or a `GEMINI_SYSTEM_INSTRUCTION` env var.
-
-```bash
-npm install -g raptor
-```
-
-**Per-session:**
-
-```bash
-gemini --system-instruction "$(cat $(npm root -g)/raptor/agents/raptor.md)"
-```
-
-**Persistent** — set in your shell profile:
-
-```bash
-export GEMINI_SYSTEM_INSTRUCTION="$(cat $(npm root -g)/raptor/agents/raptor.md)"
-```
+> **Flow runner note:** The `agent-flow-builder` skill generates `.raptor/agents.json` and `flows.json` in any tool. The interactive multi-step flow *runner* (`/flow <id>` with model-per-step switching and between-step confirmations) is VS Code only. In Claude Code and other CLI tools, flows are executed conversationally by the AI following the skill process.
 
 ---
 
 ### Codex CLI
 
+Codex CLI has no plugin manifest — it loads custom instructions and skills via `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`).
+
+**Option A — point Codex at the Raptor orchestrator as its base instructions:**
+
+```toml
+model_instructions_file = "/path/to/raptor/agents/raptor.md"
+```
+
+`model_instructions_file` replaces Codex's built-in base instructions. Use an absolute path, or a path relative to the `.codex/` folder.
+
+**Option B — register Raptor skills individually:**
+
+```toml
+[[skills.config]]
+path = "/path/to/raptor/skills/raptor"
+enabled = true
+
+[[skills.config]]
+path = "/path/to/raptor/skills/fix-bug"
+enabled = true
+
+[[skills.config]]
+path = "/path/to/raptor/skills/plan-small"
+enabled = true
+
+# ...repeat for every skill in skills/ you want available
+```
+
+Codex's `[[skills.config]]` exposes each `SKILL.md` to its native skill tool.
+
+**Option C — drop a project-level `AGENTS.md`:**
+
 ```bash
-npm install -g raptor
+cp "$RAPTOR_DIR/agents/raptor.md" ./AGENTS.md
 ```
 
-In `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`):
-
-```toml
-instructions = """
-Follow the Raptor orchestration process. Route tasks to the appropriate workflow:
-- Bugs → fix-bug skill
-- Planning → plan-small or plan-large skill
-- Audits → code-audit skill
-"""
-```
-
-Or point Codex at the orchestrator agent directly:
-
-```toml
-instructions-file = "/path/to/node_modules/raptor/agents/raptor.md"
-```
+Codex auto-loads `AGENTS.md` from the project root.
 
 ---
 
 ### OpenCode
 
+OpenCode reads skills from several locations, including `.claude/skills/` — so the Claude Code layout works without any conversion.
+
+**Option A — workspace install (clone or symlink):**
+
 ```bash
-npm install -g raptor
+# Either copy:
+mkdir -p .opencode
+cp -r "$RAPTOR_DIR/skills" .opencode/skills
+cp -r "$RAPTOR_DIR/agents" .opencode/agents
+
+# Or symlink:
+ln -s "$RAPTOR_DIR/skills" .opencode/skills
+ln -s "$RAPTOR_DIR/agents" .opencode/agents
 ```
 
-In `.opencode/config.json` (workspace) or `~/.opencode/config.json` (global):
+**Option B — global install:**
 
-```json
-{
-  "instructions": "/path/to/node_modules/raptor/agents/raptor.md"
-}
+```bash
+mkdir -p ~/.config/opencode
+ln -s "$RAPTOR_DIR/skills" ~/.config/opencode/skills
+ln -s "$RAPTOR_DIR/agents" ~/.config/opencode/agents
 ```
 
-Use `npm root -g` to get the global node_modules path.
+**Option C — reuse a Claude layout you already have:**
+
+If the workspace already has `.claude/skills/`, OpenCode will pick it up automatically. Drop Raptor's `skills/` and `agents/` there once and both tools share the same source.
+
+OpenCode invokes agents via `@<name>` and exposes skills through its native skill tool. Slash commands can be added by copying any `SKILL.md` whose name should be a command into `.opencode/commands/`.
 
 ---
 
-### Any other AI tool
+### Generic — any tool that accepts a system prompt or instructions file
 
-If your tool accepts a system prompt, instructions file, or rules file, paste the contents of:
-
-```bash
-cat "$(npm root -g)/raptor/agents/raptor.md"
-```
-
-For specific skills instead of full orchestration:
+If your tool (Cursor, Windsurf, Cline/Roo, Continue.dev, Aider, Gemini CLI, etc.) supports a custom system prompt, instructions file, or rules file, point it at:
 
 ```bash
-# List available skills
-ls "$(npm root -g)/raptor/skills/"
-
-# Get a skill's content
-cat "$(npm root -g)/raptor/skills/fix-bug/SKILL.md"
+"$RAPTOR_DIR/agents/raptor.md"          # full orchestrator
+"$RAPTOR_DIR/skills/<name>/SKILL.md"    # one specific skill
 ```
+
+Examples:
+
+- **Cursor** — `.cursor/rules/raptor.mdc` with the contents of `agents/raptor.md`
+- **Windsurf** — `.windsurf/rules/raptor.md` with the contents of `agents/raptor.md`
+- **Cline / Roo Code** — `.clinerules` (workspace) or custom mode with `agents/raptor.md` as system prompt
+- **Continue.dev** — `systemMessage` in `~/.continue/config.json` pointing at `agents/raptor.md`
+- **Aider** — `--system-prompt "$(cat $RAPTOR_DIR/agents/raptor.md)"` or `system-prompt:` in `.aider.conf.yml`
+- **Gemini CLI** — `--system-instruction "$(cat $RAPTOR_DIR/agents/raptor.md)"` or `GEMINI_SYSTEM_INSTRUCTION` env var
+
+These integrations only need the markdown content — no plugin runtime, no npm package required.
 
 ---
 
@@ -514,10 +422,11 @@ src/
     opencode-cli.ts   OpenCode CLI provider
   tools/              Tool catalog and registry
   utils/              Path helpers, logging
-skills/               Built-in Raptor skills (also exported in npm package)
-agents/               Built-in agent definitions
-plugin.json           Claude Code marketplace manifest
-dist/                 Compiled JS output (not in npm package)
+skills/               Skill pack (Claude/OpenCode plugin assets, also in npm package)
+agents/               Agent definitions (orchestrator + audit specialists)
+.claude-plugin/
+  plugin.json         Claude Code plugin manifest
+dist/                 Compiled JS output (VS Code extension runtime)
 ```
 
 ## Build

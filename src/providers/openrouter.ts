@@ -225,7 +225,7 @@ async function* streamResponse(body: ReadableStream<Uint8Array> | null): AsyncIt
         const delta = chunk.choices?.[0]?.delta
         if (!delta) continue
 
-        if (delta.content) {
+        if (delta.content != null) {
           yield { type: 'text', value: delta.content }
         }
 
@@ -243,7 +243,7 @@ async function* streamResponse(body: ReadableStream<Uint8Array> | null): AsyncIt
         }
 
         const finishReason = chunk.choices?.[0]?.finish_reason
-        if (finishReason === 'tool_calls' || finishReason === 'stop') {
+        if (finishReason === 'tool_calls') {
           for (const [, acc] of accumulators) {
             if (acc.id && acc.name) {
               try {
@@ -263,6 +263,19 @@ async function* streamResponse(body: ReadableStream<Uint8Array> | null): AsyncIt
       } catch (err) {
         if (err instanceof ProviderError) throw err
       }
+    }
+  }
+
+  for (const [, acc] of accumulators) {
+    if (acc.id && acc.name && acc.arguments) {
+      try {
+        yield {
+          type: 'tool_call',
+          callId: acc.id,
+          name: acc.name,
+          input: JSON.parse(acc.arguments),
+        }
+      } catch { /* partial args, skip */ }
     }
   }
 }

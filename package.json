@@ -1,11 +1,30 @@
 {
 	"name": "raptor",
-	"displayName": "raptor",
+	"displayName": "Raptor",
 	"version": "0.2.0",
-	"description": "Agent orchestrator — routes tasks to specialist skills and builds custom agent flows. Works as a VS Code extension, Claude Code plugin, and npm-installable skill pack.",
+	"description": "Agent orchestrator — routes tasks to specialist skills and builds custom agent flows. Works as a VS Code extension, Claude Code plugin, and skill pack for Codex CLI / OpenCode / any tool that accepts a system prompt.",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/samuelishida/raptor.git"
+	},
+	"homepage": "https://github.com/samuelishida/raptor#readme",
+	"bugs": {
+		"url": "https://github.com/samuelishida/raptor/issues"
+	},
+	"keywords": [
+		"agent",
+		"orchestrator",
+		"workflow",
+		"skills",
+		"audit",
+		"review",
+		"planning",
+		"claude",
+		"codex",
+		"opencode"
+	],
 	"files": [
-		".codex-plugin/",
 		".claude-plugin/",
 		"skills/",
 		"agents/",
@@ -30,7 +49,7 @@
 	"engines": {
 		"vscode": "^1.102.0"
 	},
-	"publisher": "your-publisher-name",
+	"publisher": "samuelishida",
 	"activationEvents": [
 		"onChatParticipant:raptor.agent",
 		"onCommand:raptor.openPanel",

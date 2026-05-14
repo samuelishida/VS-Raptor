@@ -41,6 +41,9 @@ export function createAnthropicProvider(config: AnthropicConfig): ModelProvider 
 
     async listModels(): Promise<RaptorModel[]> {
       return [
+        { id: 'claude-opus-4-7', name: 'Claude Opus 4.7', providerId: 'anthropic', maxInputTokens: 200_000 },
+        { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', providerId: 'anthropic', maxInputTokens: 200_000 },
+        { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', providerId: 'anthropic', maxInputTokens: 200_000 },
         { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', providerId: 'anthropic', maxInputTokens: 200_000 },
         { id: 'claude-3-7-sonnet-20250219', name: 'Claude 3.7 Sonnet', providerId: 'anthropic', maxInputTokens: 200_000 },
         { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', providerId: 'anthropic', maxInputTokens: 200_000 },
@@ -134,24 +137,22 @@ function buildRequestBody(
     }
   }
 
-  // If no user messages exist, prepend system content to first message
-  if (!hasUser && systemParts.length > 0 && anthropicMessages.length > 0) {
+  // If no user messages exist and we have system content, prepend a user message
+  // containing the system text. Avoid rewriting an existing assistant message.
+  if (!hasUser && systemParts.length > 0) {
     const systemText = systemParts.join('\n')
-    const otherContent = anthropicMessages[0].content
-    anthropicMessages[0] = {
+    anthropicMessages.unshift({
       role: 'user',
-      content: [
-        { type: 'text', text: systemText },
-        ...otherContent,
-      ],
-    }
+      content: [{ type: 'text', text: systemText }],
+    })
     systemParts.length = 0
   }
 
   const body: Record<string, unknown> = {
     model: model.id,
-    max_tokens: 4096,
+    max_tokens: 8192,
     messages: anthropicMessages,
+    stream: true,
   }
 
   // Only include system if we have system parts

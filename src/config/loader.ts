@@ -57,6 +57,13 @@ const AGENTS_FILE = 'agents.json'
 const FLOWS_FILE = 'flows.json'
 
 // ─── Config cache with signature-based freshness tracking ──────────────
+// Race condition note: Multiple concurrent requests could theoretically
+// compute different signatures if config files change mid-computation.
+// This is acceptable for VS Code extensions because:
+// 1. Extensions run in a single-threaded event loop (cooperative scheduling)
+// 2. Worst case: both requests reload config (inefficient but safe)
+// 3. Signature is based on file mtimes which are stable once writes complete
+// Revisit only if users report stale config issues in multi-workspace scenarios.
 
 interface CacheEntry {
   signature: string

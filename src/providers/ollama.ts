@@ -201,7 +201,7 @@ async function* streamResponse(body: ReadableStream<Uint8Array> | null): AsyncIt
       if (!line.trim()) continue
       try {
         const chunk = JSON.parse(line) as OllamaChunk
-        if (chunk.message?.content) {
+        if (chunk.message?.content != null) {
           yield { type: 'text', value: chunk.message.content }
         }
         // Ollama only sends tool_calls in the final done:true chunk
