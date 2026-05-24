@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-05-24T01:39:56.396Z",
+  "totalToolCalls": 2,
+  "messages": [
+    {
+      "role": "assistant",
+      "text": "## Flows\n\n| ID | Name | Description | Steps |\n|---|---|---|---|\n\nUse `/flow <id>` to run a flow."
+    },
+    {
+      "role": "assistant",
+      "text": "_(no project memories stored yet; use `/memory --global` to include global memory)_"
+    },
+    {
+      "role": "assistant",
+      "text": "## @raptor slash commands\n\n| Command | Description |\n|---|---|\n| `/help` | Show this reference |\n| `/memory` | Show persistent memory |\n| `/resume` | Load last session summary and continue |\n| `/todos` | Show current todo list |\n| `/clearmemory` | Wipe all persistent memory |\n| `/steer <msg>` | Inject guidance into running agent (picked up next iteration) |\n| `/agents` | List loaded agents |\n| `/agent <id>` | Switch to a specific agent |\n| `/flows` | List loaded flows |\n| `/flow <id>` | Run a specific flow |\n| `/models` | List providers, capability, and available models |\n| `/build-flow` | Design and build an agent flow for this project |\n\n## Tools\n\n| Tool | What it does |\n|---|---|\n| `readFile` | Read file (optional line range) |\n| `writeFile` | Create or overwrite a file |\n| `editFile` | Surgical old->new string replacement |\n| `multiEdit` | Batch edits across multiple files |\n| `listDir` | List directory contents |\n| `glob` | Find files by glob pattern |\n| `searchCode` | Grep -- string/regex search across files |\n| `runTerminal` | Run shell commands, capture output |\n| `webFetch` | Fetch a URL |\n| `getDiagnostics` | VS Code errors/warnings |\n| `todoWrite` | Persist todo list |\n| `memoryRead` | Read persistent memory |\n| `memoryWrite` | Write/update memory entry |\n| `lsp` | Go-to-definition, references, hover, symbols |\n| `spawnAgent` | Spawn a sub-agent with a scoped task |"
+    },
+    {
+      "role": "assistant",
+      "text": "## Flows\n\n| ID | Name | Description | Steps |\n|---|---|---|---|\n\nUse `/flow <id>` to run a flow."
+    },
+    {
+      "role": "user",
+      "text": "\n\n\n[COMMAND: /build-flow]\nFollow the agent-flow-builder skill process now.\nStart with Phase 1: read .raptor/agents.json and .raptor/flows.json using readFile; treat missing files as empty arrays.\nThen continue to Phase 2 and interview the user in one message."
+    },
+    {
+      "role": "assistant",
+      "text": "Let  me  read  the  current  config  files .  "
+    }
+  ]
+}

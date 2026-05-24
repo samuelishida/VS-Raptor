@@ -50,16 +50,11 @@ function compactPreview(toolName: string, result: string): string {
       return result === 'No files matched.' ? result : `${lineCount} files matched`
     case 'getDiagnostics':
       return result.startsWith('✓') ? result : `${lineCount} diagnostic(s)`
-    case 'memoryRead':
-      return result === '(no memories stored yet)' ? result : `${lineCount} memory line(s)`
-    case 'memoryWrite':
     case 'lsp':
     case 'spawnAgent':
       return lines[0] ?? 'ok'
     case 'webFetch':
       return `${result.length.toLocaleString()} chars fetched`
-    case 'todoWrite':
-      return lines[0] ?? 'saved'
     default: {
       const first = lines[0] ?? ''
       return first.length > 100 ? first.slice(0, 97) + '…' : first
@@ -94,11 +89,6 @@ function toolCallLabel(name: string, input: Record<string, unknown>): string {
     }
     case 'webFetch':
       return `\`${input['url'] ?? ''}\``
-    case 'memoryRead':
-    case 'memoryWrite': {
-      const scope = input['scope'] as string | undefined
-      return scope ? `\`${scope}\`` : ''
-    }
     case 'lsp': {
       const action = input['action'] as string | undefined
       const target = input['path'] as string | undefined
@@ -110,8 +100,6 @@ function toolCallLabel(name: string, input: Record<string, unknown>): string {
       if (!task) return ''
       return `\`${task.length > 60 ? task.slice(0, 57) + '…' : task}\``
     }
-    case 'todoWrite':
-      return ''
     default:
       return ''
   }

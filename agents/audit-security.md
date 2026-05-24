@@ -1,7 +1,11 @@
 ---
 name: audit-security
 description: Security specialist for hawk-skills code audits. Reviews diffs for input validation, authn/authz boundaries, injection, XSS, SSRF, secret handling, and prompt-injection trust boundaries. Used internally by hawk-skills audit fan-out — not intended for direct invocation.
-tools: Read, Grep, Glob, Bash
+permission:
+  read: allow
+  grep: allow
+  glob: allow
+  bash: allow
 model: sonnet
 ---
 

@@ -2,6 +2,7 @@ import * as vscode from 'vscode'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
+import { createHash } from 'crypto'
 import { spawn } from 'child_process'
 import { getConfig } from './src/config/model'
 import {
@@ -36,10 +37,6 @@ import {
   type ProviderRegistry,
 } from './src/providers/registry'
 import { createVSCodeProvider, setVSCodeSessionModel } from './src/providers/vscode'
-import { createAnthropicProvider } from './src/providers/anthropic'
-import { createOpenAIProvider } from './src/providers/openai'
-import { createOpenRouterProvider } from './src/providers/openrouter'
-import { createOllamaProvider } from './src/providers/ollama'
 import { createClaudeCodeProvider } from './src/providers/claude-code'
 import { createCodexProvider } from './src/providers/codex-cli'
 import { createOpenCodeProvider } from './src/providers/opencode-cli'
@@ -76,36 +73,10 @@ function getRegistry(): ProviderRegistry {
   return providerRegistry
 }
 
-// ── Steering buffer ────────────────────────────────────────────────────────────
-// Allows users to inject guidance mid-flight via `/steer <message>` or the
-// `raptor.steer` command. The agent loop drains this buffer each iteration and
-// injects the messages as new User turns so the LLM sees them immediately.
-const steeringBuffer: string[] = []
-let activeAgentId: string = '_default'
-let activeModelSpec: string | undefined
-
-function pushSteering(msg: string): void {
-  steeringBuffer.push(msg)
-}
-
-function drainSteering(): string[] {
-  return steeringBuffer.splice(0, steeringBuffer.length)
-}
-
-function setActiveAgent(id: string): void {
-  activeAgentId = id
-}
-
-function getActiveAgentId(): string {
-  return activeAgentId
-}
-
-function setActiveModelSpec(model: string | undefined): void {
-  activeModelSpec = model?.trim() || undefined
-}
-
-function getActiveModelSpec(): string | undefined {
-  return activeModelSpec
+interface RequestScope {
+  agentId: string
+  task?: string
+  isExplicitAgentRequest: boolean
 }
 
 function getConfiguredFallbackModel(): string {
@@ -133,173 +104,6 @@ function raptorDataDir(): string {
 function extensionTempDir(): string {
   const base = (process.env.TEMP || process.env.TMP || os.tmpdir()).trim()
   return path.join(base, 'raptor-temp')
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ─── PERSISTENT MEMORY SYSTEM ────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════════
-// Memory defaults to project-local state:
-//   <workspace>/.raptor/MEMORY.md
-// Global memory remains available only by explicit scope="global" reads/writes.
-
-const MEMORY_MAX_BYTES = 25 * 1024       // 25 KB per entry
-const MEMORY_INDEX_MAX_LINES = 200       // keep index under 200 lines
-
-function memoryDir(): string { return path.join(raptorDataDir(), 'memory') }
-function memoryIndexPath(): string { return path.join(memoryDir(), 'MEMORY.md') }
-
-function projectClawdDir(): string | null {
-  const root = workspaceRoot()
-  return root ? path.join(root, '.raptor') : null
-}
-function projectMemoryPath(): string | null {
-  const dir = projectClawdDir()
-  return dir ? path.join(dir, 'MEMORY.md') : null
-}
-function projectHistoryDir(): string | null {
-  const dir = projectClawdDir()
-  return dir ? path.join(dir, 'history') : null
-}
-function todoPath(): string {
-  const dir = projectClawdDir()
-  return path.join(dir ?? raptorDataDir(), 'todos.json')
-}
-
-async function readMemoryIndex(): Promise<string> {
-  try {
-    const content = await fs.readFile(memoryIndexPath(), 'utf-8')
-    return content.replace(/\r\n/g, '\n')
-  } catch { return '' }
-}
-
-async function writeMemoryIndex(content: string): Promise<void> {
-  await fs.mkdir(memoryDir(), { recursive: true })
-  const lines = content.split('\n')
-  const trimmed = lines.length > MEMORY_INDEX_MAX_LINES
-    ? lines.slice(lines.length - MEMORY_INDEX_MAX_LINES).join('\n')
-    : content
-  await fs.writeFile(memoryIndexPath(), trimmed, 'utf-8')
-}
-
-async function readProjectMemory(): Promise<string> {
-  const p = projectMemoryPath()
-  if (!p) return ''
-  try {
-    const content = await fs.readFile(p, 'utf-8')
-    return content.replace(/\r\n/g, '\n')
-  } catch { return '' }
-}
-
-async function writeProjectMemory(content: string): Promise<void> {
-  const p = projectMemoryPath()
-  if (!p) return
-  await fs.mkdir(path.dirname(p), { recursive: true })
-  const lines = content.split('\n')
-  const trimmed = lines.length > MEMORY_INDEX_MAX_LINES
-    ? lines.slice(lines.length - MEMORY_INDEX_MAX_LINES).join('\n')
-    : content
-  await fs.writeFile(p, trimmed, 'utf-8')
-}
-
-// ── Workspace profile ──────────────────────────────────────────────────────────
-// Auto-scanned on first prompt per session. Cached in <workspace>/.raptor/profile.md
-let workspaceProfileCache: string | null = null
-
-async function getOrBuildWorkspaceProfile(): Promise<string> {
-  if (workspaceProfileCache) return workspaceProfileCache
-
-  const pDir = projectClawdDir()
-  if (!pDir) return ''
-
-  // Try loading cached profile
-  const profilePath = path.join(pDir, 'profile.md')
-  try {
-    const cached = await fs.readFile(profilePath, 'utf-8')
-    const lines = cached.split('\n')
-    // Check if it's recent (header line has date)
-    const dateLine = lines.find(l => l.includes('Generated:'))
-    if (dateLine) {
-      const dateStr = dateLine.replace(/.*Generated:\s*/, '').trim()
-      const cacheDate = new Date(dateStr)
-      const ageMs = Date.now() - cacheDate.getTime()
-      if (ageMs < 24 * 60 * 60 * 1000) { // less than 24h old
-        workspaceProfileCache = cached
-        return cached
-      }
-    }
-  } catch { /* no cache, build it */ }
-
-  // Build fresh profile
-  const root = workspaceRoot()
-  if (!root) return ''
-
-  const profile: string[] = [`# Workspace Profile`, `Generated: ${new Date().toISOString()}`]
-
-  // Package.json
-  try {
-    const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf-8'))
-    profile.push(`\n## Node.js Project`)
-    if (pkg.name) profile.push(`- Name: ${pkg.name}`)
-    if (pkg.description) profile.push(`- Description: ${pkg.description}`)
-    if (pkg.scripts) profile.push(`- Scripts: ${Object.keys(pkg.scripts).join(', ')}`)
-    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies }
-    const keyDeps = Object.keys(allDeps).filter(d =>
-      /react|vue|angular|next|express|fastify|nest|typeorm|prisma|jest|mocha|vitest|webpack|vite|esbuild|typescript|tailwind|eslint|prettier/i.test(d)
-    )
-    if (keyDeps.length) profile.push(`- Key deps: ${keyDeps.join(', ')}`)
-  } catch { /* no package.json */ }
-
-  // pom.xml / build.gradle
-  for (const buildFile of ['pom.xml', 'build.gradle', 'build.gradle.kts']) {
-    try {
-      await fs.access(path.join(root, buildFile))
-      profile.push(`\n## JVM Project (${buildFile})`)
-    } catch { /* not found */ }
-  }
-
-  // Python
-  for (const pyFile of ['pyproject.toml', 'setup.py', 'requirements.txt', 'Pipfile']) {
-    try {
-      await fs.access(path.join(root, pyFile))
-      profile.push(`\n## Python Project (${pyFile})`)
-      if (pyFile === 'requirements.txt') {
-        const reqs = (await fs.readFile(path.join(root, pyFile), 'utf-8')).split('\n').filter(l => l.trim() && !l.startsWith('#')).slice(0, 30)
-        profile.push(`- Dependencies: ${reqs.map(r => r.split('=')[0].split('>')[0].split('<')[0].trim()).join(', ')}`)
-      }
-    } catch { /* not found */ }
-  }
-
-  // tsconfig
-  try {
-    const tsc = JSON.parse(await fs.readFile(path.join(root, 'tsconfig.json'), 'utf-8'))
-    profile.push(`\n## TypeScript Config`)
-    if (tsc.compilerOptions?.target) profile.push(`- Target: ${tsc.compilerOptions.target}`)
-    if (tsc.compilerOptions?.module) profile.push(`- Module: ${tsc.compilerOptions.module}`)
-    if (tsc.compilerOptions?.strict !== undefined) profile.push(`- Strict: ${tsc.compilerOptions.strict}`)
-  } catch { /* no tsconfig */ }
-
-  // Top-level directory listing (first 50 entries)
-  try {
-    const entries = await fs.readdir(root, { withFileTypes: true })
-    const dirs = entries.filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name + '/').slice(0, 30)
-    const files = entries.filter(e => e.isFile()).map(e => e.name).slice(0, 20)
-    profile.push(`\n## Workspace Structure`)
-    profile.push(`Dirs: ${dirs.join(', ')}`)
-    profile.push(`Files: ${files.join(', ')}`)
-  } catch { /* can't list */ }
-
-  const result = profile.join('\n')
-  workspaceProfileCache = result
-
-  // Cache to disk
-  try {
-    await fs.mkdir(pDir, { recursive: true })
-    await fs.writeFile(profilePath, result, 'utf-8')
-  } catch (err) {
-    logToOutput(`[profile] Failed to cache workspace profile: ${String(err)}`)
-  }
-
-  return result
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -418,201 +222,6 @@ async function fullCompactMessages(
     return microCompactMessages(messages, 6)
   }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ─── SESSION RESUME + CONVERSATION HISTORY ───────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function sessionSummaryPath(): string {
-  const pDir = projectClawdDir()
-  return pDir ? path.join(pDir, 'last-session-summary.md') : path.join(raptorDataDir(), 'last-session-summary.md')
-}
-
-async function saveSessionSummary(summary: string): Promise<void> {
-  try {
-    const p = sessionSummaryPath()
-    await fs.mkdir(path.dirname(p), { recursive: true })
-    await fs.writeFile(p, summary, 'utf-8')
-  } catch (err) {
-    logToOutput(`[session] Failed to save session summary: ${String(err)}`)
-  }
-}
-
-async function loadSessionSummary(): Promise<string | null> {
-  try {
-    const content = await fs.readFile(sessionSummaryPath(), 'utf-8')
-    return content.trim() ? content.replace(/\r\n/g, '\n') : null
-  } catch { return null }
-}
-
-// ── Conversation history persistence ────────────────────────────────────────
-// Saves a serialisable snapshot of the conversation so /resume can reload
-// actual messages rather than just a summary.
-interface ConversationSnapshot {
-  timestamp: string
-  messages: Array<{ role: 'user' | 'assistant'; text: string }>
-  totalToolCalls: number
-}
-
-async function saveConversationHistory(
-  messages: RaptorMessage[],
-  totalToolCalls: number,
-): Promise<void> {
-  try {
-    const hDir = projectHistoryDir() ?? path.join(raptorDataDir(), 'history')
-    await fs.mkdir(hDir, { recursive: true })
-
-    const snapshot: ConversationSnapshot = {
-      timestamp: new Date().toISOString(),
-      totalToolCalls,
-      messages: messages.slice(1).map(m => ({
-        role: m.role === 'user' ? 'user' as const : 'assistant' as const,
-        text: m.content
-          .filter((p): p is RaptorTextPart => p.type === 'text')
-          .map(p => p.value).join(' ')
-          .slice(0, 5000),
-      })).filter(m => m.text.trim()),
-    }
-
-    // Keep last 5 sessions
-    const files = (await fs.readdir(hDir)).filter(f => f.startsWith('session-') && f.endsWith('.json')).sort()
-    if (files.length >= 5) {
-      for (const old of files.slice(0, files.length - 4)) {
-        try { await fs.unlink(path.join(hDir, old)) } catch { /* */ }
-      }
-    }
-
-    const filename = `session-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
-    await fs.writeFile(path.join(hDir, filename), JSON.stringify(snapshot, null, 2), 'utf-8')
-  } catch (err) {
-    logToOutput(`[history] Failed to save conversation history: ${String(err)}`)
-  }
-}
-
-async function loadRecentHistory(): Promise<ConversationSnapshot | null> {
-  const dirs = [projectHistoryDir() ?? path.join(raptorDataDir(), 'history')]
-  for (const hDir of dirs) {
-    try {
-      const files = (await fs.readdir(hDir)).filter(f => f.startsWith('session-') && f.endsWith('.json')).sort()
-      if (!files.length) continue
-      const latest = await fs.readFile(path.join(hDir, files[files.length - 1]), 'utf-8')
-      return JSON.parse(latest) as ConversationSnapshot
-    } catch { continue }
-  }
-  return null
-}
-
-async function generateSessionSummary(
-  messages: RaptorMessage[],
-  resolved: ResolvedModel,
-  token: vscode.CancellationToken,
-): Promise<string> {
-  const convoText = messages.filter(m => m.role !== 'system')
-    .map(m => {
-      const role = m.role === 'user' ? 'User' : 'Assistant'
-      const text = m.content
-        .filter((p): p is RaptorTextPart => p.type === 'text')
-        .map(p => p.value).join(' ')
-      return `${role}: ${text.slice(0, 1500)}`
-    }).join('\n\n').slice(0, 30_000)
-
-  if (!convoText.trim()) return ''
-
-  const prompt = [
-    'Summarise this coding session in 300-500 words for resumption in a future session.',
-    'Include: goals, files changed, key decisions, unfinished work, important context.',
-    'Start with: "# Session Summary -- ' + new Date().toLocaleDateString() + '"',
-    '', convoText,
-  ].join('\n')
-
-  try {
-    const stream = await resolved.provider.sendRequest(
-      resolved.model,
-      [{ role: 'user', content: [{ type: 'text', value: prompt }] }],
-      {},
-      token,
-    )
-    let summary = ''
-    for await (const part of stream) {
-      if (part.type === 'text') summary += part.value
-    }
-    return summary.trim()
-  } catch {
-    return `# Session Summary -- ${new Date().toLocaleDateString()}\n\n(Summary generation failed)`
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ─── MEMORY EXTRACTION (post-turn) ──────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════════
-
-async function extractAndStoreMemories(
-  userPrompt: string,
-  assistantResponse: string,
-): Promise<void> {
-  try {
-    const models = await vscode.lm.selectChatModels()
-    const model = models.find(m =>
-      /gpt-4o-mini/i.test(m.id) || /gpt-4o-mini/i.test(m.family) || /gpt-4o-mini/i.test(m.name),
-    ) ?? models[0]
-    if (!model) return
-
-    const extractPrompt = [
-      'Analyse this Q&A exchange. Extract project-specific facts for the current workspace only.',
-      '',
-      '## PROJECT FACTS',
-      'File conventions, architecture decisions, build commands, known issues, and workflow state. 0-5 items.',
-      'Format: "- [project] <fact>"',
-      '',
-      '## CORRECTIONS (if the user corrected the assistant)',
-      'What the assistant did wrong and what the right approach is. 0-2 items.',
-      'These are HIGH PRIORITY -- the assistant must not repeat the mistake.',
-      'Format: "- [correction] WRONG: <what was wrong>. RIGHT: <what to do instead>"',
-      '',
-      'If nothing worth remembering, reply with: (none)',
-      '',
-      `USER ASKED: ${userPrompt.slice(0, 800)}`,
-      '',
-      `ASSISTANT DID: ${assistantResponse.slice(0, 1500)}`,
-    ].join('\n')
-
-    const response = await model.sendRequest(
-      [vscode.LanguageModelChatMessage.User(extractPrompt)],
-      {}, new vscode.CancellationTokenSource().token,
-    )
-    let extracted = ''
-    for await (const part of response.stream) {
-      if (part instanceof vscode.LanguageModelTextPart) extracted += part.value
-    }
-    extracted = extracted.trim()
-    if (!extracted || extracted.includes('(none)') || extracted.length < 10) return
-
-    const lines = extracted.split('\n').map(l => l.trim()).filter(l => l.startsWith('- '))
-    const projectFacts: string[] = []
-
-    for (const line of lines) {
-      const text = line.replace(/^- \[(global|project|correction)\]\s*/i, '- ')
-      if (/\[correction\]/i.test(line)) {
-        projectFacts.push(`- **CORRECTION**: ${text.replace(/^- /, '')}`)
-      } else {
-        projectFacts.push(text)
-      }
-    }
-
-    const timestamp = new Date().toISOString().split('T')[0]
-
-    // Save project facts
-    if (projectFacts.length > 0) {
-      let pMem = await readProjectMemory()
-      const block = `## session-facts (${timestamp})\n${projectFacts.join('\n')}\n`
-      pMem = pMem ? pMem.trimEnd() + '\n\n' + block : block
-      await writeProjectMemory(pMem)
-    }
-  } catch (err) {
-    logToOutput(`[memory] Failed to extract memories: ${String(err)}`)
-  }
-}
-
 // ─── Activation ───────────────────────────────────────────────────────────────
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -623,7 +232,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   providerRegistry = createProviderRegistry(context)
   providerRegistry.register(createVSCodeProvider())
 
-  const configs = await loadProviderConfigs(context)
+  const providerConfigResult = await loadProviderConfigs(context)
+  for (const warning of providerConfigResult.warnings) {
+    logToOutput(warning)
+  }
+
+  const configs = providerConfigResult.configs
   for (const [id, cfg] of Object.entries(configs)) {
     if (!cfg.enabled) {
       logProviderStatus(id, 'disabled', logToOutput)
@@ -632,47 +246,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     switch (id) {
       case 'vscode': continue
-      case 'anthropic': {
-        const apiKey = cfg.apiKey
-        const deprecatedKey = vscode.workspace.getConfiguration('raptor').get<string>('provider.anthropic.apiKey', '')
-        getRegistry().register(createAnthropicProvider({ apiKey: apiKey || deprecatedKey, baseUrl: cfg.baseUrl }))
-        if (deprecatedKey && !apiKey) {
-          logToOutput('[provider] Anthropic: using deprecated plain-text API key setting. Migrate to VS Code SecretStorage.')
-        }
-        break
-      }
-      case 'openai': {
-        const apiKey = cfg.apiKey
-        const deprecatedKey = vscode.workspace.getConfiguration('raptor').get<string>('provider.openai.apiKey', '')
-        getRegistry().register(createOpenAIProvider({ apiKey: apiKey || deprecatedKey, baseUrl: cfg.baseUrl }))
-        if (deprecatedKey && !apiKey) {
-          logToOutput('[provider] OpenAI: using deprecated plain-text API key setting. Migrate to VS Code SecretStorage.')
-        }
-        break
-      }
-      case 'openrouter': {
-        const apiKey = cfg.apiKey
-        const deprecatedKey = vscode.workspace.getConfiguration('raptor').get<string>('provider.openrouter.apiKey', '')
-        getRegistry().register(createOpenRouterProvider({ apiKey: apiKey || deprecatedKey, baseUrl: cfg.baseUrl }))
-        if (deprecatedKey && !apiKey) {
-          logToOutput('[provider] OpenRouter: using deprecated plain-text API key setting. Migrate to VS Code SecretStorage.')
-        }
-        break
-      }
-      case 'ollama': {
-        getRegistry().register(createOllamaProvider({ baseUrl: cfg.baseUrl || 'http://localhost:11434' }))
-        break
-      }
       case 'claude-code': {
-        getRegistry().register(createClaudeCodeProvider({ apiKey: cfg.apiKey, model: cfg.defaultModel, command: cfg.command }))
+        getRegistry().register(createClaudeCodeProvider({ model: cfg.defaultModel, command: cfg.command }))
         break
       }
       case 'codex': {
-        getRegistry().register(createCodexProvider({ apiKey: cfg.apiKey, model: cfg.defaultModel, command: cfg.command }))
+        getRegistry().register(createCodexProvider({ model: cfg.defaultModel, command: cfg.command }))
         break
       }
       case 'opencode': {
-        getRegistry().register(createOpenCodeProvider({ apiKey: cfg.apiKey, model: cfg.defaultModel, command: cfg.command }))
+        getRegistry().register(createOpenCodeProvider({ model: cfg.defaultModel, command: cfg.command }))
         break
       }
     }
@@ -692,138 +275,7 @@ export function deactivate(): void {}
 
 type ToolInput = Record<string, unknown>
 
-// ── Steering function ──────────────────────────────────────────────────────────
-// Intercepts and rewrites LLM tool-call inputs BEFORE execution to fix
-// known-bad patterns that the model frequently generates. This is a defence-in-
-// depth layer on top of the system-prompt guardrails.
-//
-// Rules are additive -- add new cases as new failure patterns emerge.
-function steerToolCall(name: string, input: ToolInput): void {
-  const isWin = process.platform === 'win32'
-  const tempDir = extensionTempDir()
-
-  // ── runTerminal steering ──────────────────────────────────────────────────
-  if (name === 'runTerminal' && typeof input['command'] === 'string') {
-    let cmd = input['command'] as string
-
-    // 1. COMPREHENSIVE C:\ root redirect.
-    //    The model loves writing temp files to C:\ root (commit-msg.txt, patch.diff, etc.)
-    //    which fails because users don't have write access there.
-    //    Strategy: replace ALL occurrences of C:\<bare-filename> (not under a real subdir)
-    //    with $TEMP\<filename>.  A "bare filename" = C:\ followed by a name with no further backslash.
-    if (isWin) {
-      // Match C:\someFile.ext or "C:\someFile.ext" or 'C:\someFile.ext'
-      // but NOT C:\Users\..., C:\Program Files\..., C:\Windows\..., etc.
-      const safeRoots = /^(Users|Program|Windows|ProgramData|tools|apps|opt)/i
-      cmd = cmd.replace(
-        /(?:["']?)C:\\([a-zA-Z0-9_. -]+?)(?=["'\s;|>)`]|$)/gi,
-        (match, afterBackslash: string) => {
-          // If it continues with \ it's a subdir — leave it alone
-          // (this regex already prevents that by not including \ in the capture)
-          // If it looks like a known safe subdirectory, leave it
-          if (safeRoots.test(afterBackslash)) return match
-          // If it has no dot and could be a directory name like C:\repos, leave it
-          // (heuristic: real temp files almost always have extensions)
-          if (!afterBackslash.includes('.') && afterBackslash.length < 20) return match
-          const fixed = match.replace(/C:\\/i, `${tempDir}\\`)
-          logToOutput(`[steering] Redirected "${match}" -> "${fixed}"`)
-          return fixed
-        },
-      )
-
-      // Specific git pattern: git commit -F <path>
-      // Rewrite to use -m instead if the file doesn't exist yet, or redirect the path
-      cmd = cmd.replace(
-        /git\s+commit\s+.*?-F\s+["']?C:\\([^"'\s;|]+)["']?/gi,
-        (match, filename: string) => {
-          if (safeRoots.test(filename)) return match
-          const redirected = match.replace(/C:\\/i, `${tempDir}\\`)
-          logToOutput(`[steering] Redirected git -F path: "${match}" -> "${redirected}"`)
-          return redirected
-        },
-      )
-    }
-
-    // 2. Rewrite PowerShell-isms to cmd.exe equivalents (model sometimes still generates PS syntax)
-    if (isWin) {
-      // $env:VAR -> %VAR%
-      cmd = cmd.replace(/\$env:([A-Za-z_]+)/g, '%$1%')
-      // Out-File "path" -> > "path"
-      cmd = cmd.replace(/\|\s*Out-File\s+/gi, '> ')
-      // Set-Content -> echo ... >
-      // Get-Content -> type
-      cmd = cmd.replace(/(?:^|&&\s*|&\s*)Get-Content\s+/gi, (m) => m.replace(/Get-Content/i, 'type'))
-      // Remove PowerShell encoding preambles that the model might still hallucinate
-      cmd = cmd.replace(/\[Console\]::OutputEncoding\s*=\s*[^;]+;\s*/gi, '')
-      cmd = cmd.replace(/\$OutputEncoding\s*=\s*[^;]+;\s*/gi, '')
-      // Remove chcp calls (no longer needed with spawn + UTF-8 env)
-      cmd = cmd.replace(/chcp\s+65001\s*[;&|]?\s*/gi, '')
-      // Replace PowerShell semicolons with && for cmd.exe
-      // (only if the command looks like PS syntax with semicolons as separators)
-      // Don't replace semicolons inside quotes
-    }
-
-    // 3. Prevent catastrophic commands
-    if (/rm\s+(-rf?|\/s)\s+[/\\]($|\s)/i.test(cmd) || /Remove-Item\s+[/\\]\s/i.test(cmd) || /del\s+\/[sq]\s+[/\\]/i.test(cmd)) {
-      input['command'] = 'echo BLOCKED: Refusing to delete root filesystem'
-      logToOutput(`[steering] BLOCKED destructive command: ${cmd}`)
-      return
-    }
-
-    // 4. Prevent disk operations
-    if (/(?:format|fdisk|diskpart)\s/i.test(cmd)) {
-      input['command'] = 'echo BLOCKED: Disk operations not allowed'
-      logToOutput(`[steering] BLOCKED disk operation: ${cmd}`)
-      return
-    }
-
-    input['command'] = cmd
-  }
-
-  // ── editFile / multiEdit steering ─────────────────────────────────────────
-  if (name === 'editFile' || name === 'multiEdit') {
-    // Fix model sending paths starting with / on Windows (e.g. /H:/repos/...)
-    if (isWin) {
-      if (typeof input['path'] === 'string') {
-        input['path'] = (input['path'] as string).replace(/^\/([A-Za-z]:)/, '$1')
-      }
-      if (Array.isArray(input['edits'])) {
-        for (const edit of input['edits'] as Array<Record<string, unknown>>) {
-          if (typeof edit['path'] === 'string') {
-            edit['path'] = (edit['path'] as string).replace(/^\/([A-Za-z]:)/, '$1')
-          }
-        }
-      }
-    }
-  }
-
-  // ── writeFile steering ────────────────────────────────────────────────────
-  if (name === 'writeFile' && typeof input['path'] === 'string') {
-    const p = input['path'] as string
-    // Block writes to C:\ root
-    if (isWin && /^C:\\[^\\]+$/i.test(p)) {
-      const filename = path.basename(p)
-      input['path'] = path.join(tempDir, filename)
-      logToOutput(`[steering] Redirected writeFile C:\\${filename} -> ${tempDir}\\${filename}`)
-    }
-    // Fix leading slash on Windows
-    if (isWin) {
-      input['path'] = (input['path'] as string).replace(/^\/([A-Za-z]:)/, '$1')
-    }
-  }
-
-  // ── readFile steering ─────────────────────────────────────────────────────
-  if (name === 'readFile' && typeof input['path'] === 'string') {
-    if (isWin) {
-      input['path'] = (input['path'] as string).replace(/^\/([A-Za-z]:)/, '$1')
-    }
-  }
-}
-
 async function dispatchTool(name: string, input: ToolInput, token?: vscode.CancellationToken): Promise<string> {
-  // ── Steering: rewrite known-bad patterns before execution ─────────────────
-  steerToolCall(name, input)
-
   switch (name) {
     case 'readFile':       return toolReadFile(input)
     case 'writeFile':      return toolWriteFile(input)
@@ -835,9 +287,6 @@ async function dispatchTool(name: string, input: ToolInput, token?: vscode.Cance
     case 'runTerminal':    return toolRunTerminal(input)
     case 'webFetch':       return toolWebFetch(input)
     case 'getDiagnostics': return toolGetDiagnostics(input)
-    case 'todoWrite':      return toolTodoWrite(input)
-    case 'memoryRead':     return toolMemoryRead(input)
-    case 'memoryWrite':    return toolMemoryWrite(input)
     case 'lsp':            return toolLsp(input)
     case 'spawnAgent':     return toolSpawnAgent(input)
     default: return `Unknown tool: ${name}`
@@ -1648,74 +1097,6 @@ async function toolGetDiagnostics(input: ToolInput): Promise<string> {
   return lines.join('\n')
 }
 
-// ── todoWrite ────────────────────────────────────────────────────────────
-async function toolTodoWrite(input: ToolInput): Promise<string> {
-  const todos = input['todos']
-  const filePath = todoPath()
-  try {
-    await fs.mkdir(path.dirname(filePath), { recursive: true })
-    await fs.writeFile(filePath, JSON.stringify(todos, null, 2), 'utf-8')
-    const count = Array.isArray(todos) ? todos.length : '?'
-    return `✓ Saved ${count} todos to ${filePath}`
-  } catch (err) {
-    return `Error writing todos: ${String(err)}`
-  }
-}
-
-// ── memoryRead ───────────────────────────────────────────────────────────
-async function toolMemoryRead(input?: ToolInput): Promise<string> {
-  const scope = (input?.['scope'] as string | undefined) ?? 'project'
-  const parts: string[] = []
-
-  if (scope === 'all' || scope === 'global') {
-    const content = await readMemoryIndex()
-    if (content.trim()) parts.push(`# Global Memory\n${content}`)
-  }
-  if (scope === 'all' || scope === 'project') {
-    const content = await readProjectMemory()
-    if (content.trim()) parts.push(`# Project Memory\n${content}`)
-  }
-
-  return parts.length > 0 ? parts.join('\n\n---\n\n') : '(no memories stored yet)'
-}
-
-// ── memoryWrite ──────────────────────────────────────────────────────────
-async function toolMemoryWrite(input: ToolInput): Promise<string> {
-  const topic   = (input['topic']   as string | undefined) ?? 'general'
-  const content = input['content']  as string
-  const replace = (input['replace'] as boolean | undefined) ?? false
-  const scope   = (input['scope']   as string | undefined) ?? 'project'
-
-  if (!content?.trim()) return 'Error: content is required'
-
-  const entry = content.length > MEMORY_MAX_BYTES
-    ? content.slice(0, MEMORY_MAX_BYTES) + '\n...[truncated]'
-    : content
-
-  const timestamp = new Date().toISOString().split('T')[0]
-  const heading   = `## ${topic} (${timestamp})`
-  const block     = `${heading}\n${entry.trim()}\n`
-
-  const readFn  = scope === 'project' ? readProjectMemory  : readMemoryIndex
-  const writeFn = scope === 'project' ? writeProjectMemory : writeMemoryIndex
-
-  let index = await readFn()
-  if (replace) {
-    const escapedTopic = topic.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const sectionRe = new RegExp(`## ${escapedTopic}[^\n]*\n(?:(?!## )[\\s\\S])*`, 'g')
-    if (sectionRe.test(index)) {
-      index = index.replace(sectionRe, block)
-    } else {
-      index = index ? index.trimEnd() + '\n\n' + block : block
-    }
-  } else {
-    index = index ? index.trimEnd() + '\n\n' + block : block
-  }
-
-  await writeFn(index)
-  return `Memory saved [${scope}]: "${topic}" (${entry.length} chars)`
-}
-
 // ── lsp ──────────────────────────────────────────────────────────────────
 async function toolLsp(input: ToolInput): Promise<string> {
   const action   = input['action'] as string
@@ -1841,7 +1222,7 @@ async function toolSpawnAgent(input: ToolInput): Promise<string> {
   if (!task?.trim()) return 'Error: task is required'
 
   const loaded = await getLoadedConfig()
-  const activeAgent = loaded.agents.get(getActiveAgentId()) ?? loaded.agents.get('_default')!
+  const activeAgent = loaded.agents.get('_default')!
   const allToolNames = getToolDefs().map(t => t.name)
   const agentAllowed = filterToolsByAgent(allToolNames, activeAgent.tools)
   const effectiveTools = toolsAllowed.filter(t => agentAllowed.includes(t))
@@ -1915,8 +1296,28 @@ async function toolSpawnAgent(input: ToolInput): Promise<string> {
 
 // ─── Chat participant ──────────────────────────────────────────────────────────
 
+function createFlowFollowupProvider(): vscode.ChatFollowupProvider {
+  return {
+    async provideFollowups(
+      _result: vscode.ChatResult,
+      _context: vscode.ChatContext,
+      _token: vscode.CancellationToken,
+    ): Promise<vscode.ChatFollowup[]> {
+      const loaded = await getLoadedConfig()
+      const flows = Array.from(loaded.flows.values())
+      if (flows.length === 0) {
+        return []
+      }
+      return flows.map(f => ({
+        prompt: `/flow ${f.id}`,
+        label: `Run ${f.name ?? f.id} flow`,
+      }))
+    },
+  }
+}
+
 function registerChatParticipant(context: vscode.ExtensionContext): void {
-  registerChatParticipantModule(context, handleChatRequest)
+  registerChatParticipantModule(context, handleChatRequest, createFlowFollowupProvider())
 }
 
 async function handleChatRequest(
@@ -1940,95 +1341,15 @@ async function handleChatRequest(
     return {}
   }
 
-  if (request.command === 'memory' || promptTrimmed === '/memory') {
-    const showGlobal = /\s--global(?:\s|$)/.test(promptTrimmed) || /\s--all(?:\s|$)/.test(promptTrimmed)
-    const [globalMem, projectMem] = await Promise.all([
-      showGlobal ? readMemoryIndex() : Promise.resolve(''),
-      readProjectMemory(),
-    ])
-    const parts: string[] = []
-    if (projectMem.trim()) parts.push(`## Project Memory\n\n${projectMem}`)
-    if (globalMem.trim()) parts.push(`## Global Memory\n\n${globalMem}`)
-    stream.markdown(parts.length > 0
-      ? parts.join('\n\n---\n\n')
-      : showGlobal ? '_(no memories stored yet)_' : '_(no project memories stored yet; use `/memory --global` to include global memory)_')
-    return {}
-  }
-
-  if (request.command === 'resume' || promptTrimmed === '/resume') {
-    const [summary, history] = await Promise.all([loadSessionSummary(), loadRecentHistory()])
-    const parts: string[] = []
-
-    if (summary) {
-      parts.push(`## Session Summary\n\n${summary}`)
-    }
-    if (history) {
-      const age = Date.now() - new Date(history.timestamp).getTime()
-      const ageStr = age < 3600_000 ? `${Math.round(age / 60_000)}m ago` : `${Math.round(age / 3600_000)}h ago`
-      const lastMsgs = history.messages.slice(-6).map(m =>
-        `**${m.role}**: ${m.text.slice(0, 300)}${m.text.length > 300 ? '...' : ''}`
-      ).join('\n\n')
-      parts.push(`## Last Conversation (${ageStr}, ${history.totalToolCalls} tool calls)\n\n${lastMsgs}`)
-    }
-
-    if (parts.length === 0) {
-      stream.markdown('No previous session data found.')
-    } else {
-      stream.markdown(`**Resuming previous session:**\n\n${parts.join('\n\n---\n\n')}`)
-    }
-    return {}
-  }
-
-  if (request.command === 'todos' || promptTrimmed === '/todos') {
-    const todosPath = todoPath()
-    let raw = ''
-    try { raw = await fs.readFile(todosPath, 'utf-8') } catch { /* not found */ }
-    if (!raw.trim()) {
-      stream.markdown('_(no todos file found)_')
-    } else {
-      try {
-        const parsed = JSON.parse(raw)
-        if (Array.isArray(parsed)) {
-          const statusIcon = (s: string) => s === 'completed' ? '\\u2705' : s === 'in_progress' ? '\\ud83d\\udd04' : '\\u2b1c'
-          const rows = parsed.map((t: any) =>
-            `${statusIcon(t.status ?? '')} **${t.title ?? t.id ?? '?'}** \`[${t.status ?? '?'}]\`` +
-            (t.description ? `\n   > ${t.description}` : '')
-          ).join('\n')
-          stream.markdown(`**Todos** (${todosPath}):\n\n${rows}`)
-        } else {
-          stream.markdown(`**Todos** (${todosPath}):\n\`\`\`json\n${raw}\n\`\`\``)
-        }
-      } catch { stream.markdown(`**Todos** (${todosPath}):\n\`\`\`json\n${raw}\n\`\`\``) }
-    }
-    return {}
-  }
-
-  if (request.command === 'clearmemory' || promptTrimmed === '/clearmemory') {
-    const clearGlobal = /\s--global(?:\s|$)/.test(promptTrimmed) || /\s--all(?:\s|$)/.test(promptTrimmed)
-    const cleared: string[] = []
-    const pm = projectMemoryPath()
-    if (pm) { try { await fs.unlink(pm); cleared.push('project') } catch (err) { logToOutput(`[clearmemory] Failed to delete project memory: ${err}`) } }
-    if (clearGlobal) {
-      try { await fs.unlink(memoryIndexPath()); cleared.push('global') } catch (err) { logToOutput(`[clearmemory] Failed to delete global memory: ${err}`) }
-    }
-    stream.markdown(cleared.length > 0 ? `Cleared: ${cleared.join(', ')} memory.` : 'No memory to clear.')
-    return {}
-  }
-
-  // /steer — inject guidance into a running agent session.
-  // The message is pushed to the steering buffer and will be picked up by whichever
-  // agent loop iteration runs next.  If no agent is running, it's just queued
-  // until the next @raptor prompt.
-  if (request.command === 'steer' || promptTrimmed.startsWith('/steer ')) {
-    const steerMsg = request.command === 'steer'
-      ? request.prompt.trim()
-      : promptTrimmed.replace(/^\/steer\s+/, '')
-    if (!steerMsg) {
-      stream.markdown('Usage: `/steer <guidance>` -- inject steering into the running agent.')
-      return {}
-    }
-    pushSteering(steerMsg)
-    stream.markdown(`Steering queued (will be injected on the agent's next iteration):\n> ${steerMsg}`)
+  if (
+    request.command === 'memory' ||
+    request.command === 'resume' ||
+    request.command === 'todos' ||
+    request.command === 'clearmemory' ||
+    request.command === 'steer' ||
+    /^\/(?:memory|resume|todos|clearmemory|steer)\b/.test(promptTrimmed)
+  ) {
+    stream.markdown('This legacy command has been removed. Use `/help` for the current orchestration commands.')
     return {}
   }
 
@@ -2044,30 +1365,55 @@ async function handleChatRequest(
     logToOutput(`[config] Flows: ${Array.from(loaded.flows.keys()).join(', ')}`)
   }
 
-  // ── /agents — list loaded agents ──────────────────────────────────────────
-  if (request.command === 'agents' || promptTrimmed === '/agents') {
-    const rows = Array.from(loaded.agents.values()).map(a => {
-      const tools = a.tools === null ? 'all' : (a.tools?.join(', ') ?? 'all')
-      return `| \`${a.id}\` | ${a.name ?? a.id} | ${a.description ?? '-'} | ${a.model ?? '-'} | ${tools} |`
-    })
+  let requestScope: RequestScope | undefined
+
+  if (request.command === 'skills' || promptTrimmed === '/skills') {
+    const skills = Array.from(loaded.skills.values())
+    if (skills.length === 0) {
+      stream.markdown('## Skills\n\nNo skills are loaded in this workspace yet.')
+      return {}
+    }
+
+    const rows = skills.map(skill => `| \`${skill.id}\` | ${skill.source} |`)
     stream.markdown([
-      '## Agents',
+      '## Skills',
       '',
-      '| ID | Name | Description | Model | Tools |',
-      '|---|---|---|---|---|',
+      '| ID | Source |',
+      '|---|---|',
       ...rows,
       '',
-      'Use `/agent <id>` to switch agent for the session.',
+      'Use a skill by attaching it to an agent or installing it as a normal markdown skill pack.',
     ].join('\n'))
     return {}
   }
 
-  // ── /agent <id> — switch active agent ─────────────────────────────────────
+  // ── /agents — list loaded agents ──────────────────────────────────────────
+  if (request.command === 'agents' || promptTrimmed === '/agents') {
+    const rows = Array.from(loaded.agents.values()).map(a => {
+      const tools = a.tools === null ? 'all' : (a.tools?.join(', ') ?? 'all')
+      return `| \`${a.id}\` | ${a.name ?? a.id} | ${a.description ?? '-'} | ${a.model ?? '-'} | ${tools} | ${a.source ?? '-'} |`
+    })
+    stream.markdown([
+      '## Agents',
+      '',
+      '| ID | Name | Description | Model | Tools | Source |',
+      '|---|---|---|---|---|---|',
+      ...rows,
+      '',
+      'Use `/agent <id>` to inspect an agent, or `/agent <id> <task...>` to run a request-scoped task with it.',
+      loaded.imports.length > 0
+        ? `Imported configs detected but quarantined: ${loaded.imports.map(imported => `${imported.origin} (${imported.agents.length} agent${imported.agents.length === 1 ? '' : 's'})`).join(', ')}.`
+        : '',
+    ].join('\n'))
+    return {}
+  }
+
+  // ── /agent <id> — inspect or run one-off task ────────────────────────────
   if (request.command === 'agent' || promptTrimmed.startsWith('/agent ')) {
     const agentArgs = getCommandArgs(promptTrimmed, 'agent')
-    const agentId = agentArgs.split(/\s+/)[0] ?? ''
+    const [agentId, ...rest] = agentArgs.split(/\s+/)
     if (!agentId) {
-      stream.markdown('Usage: `/agent <id>` -- switch to a loaded agent. Use `/agents` to list.')
+      stream.markdown('Usage: `/agent <id>` to inspect a loaded agent, or `/agent <id> <task...>` to run a request-scoped task. Use `/agents` to list.')
       return {}
     }
     const agent = loaded.agents.get(agentId)
@@ -2075,14 +1421,24 @@ async function handleChatRequest(
       stream.markdown(`Agent "${agentId}" not found. Use \`/agents\` to list available agents.`)
       return {}
     }
-    // Inject a hidden marker into chat history so future turns remember the agent
-    setActiveAgent(agent.id)
-    setActiveModelSpec(agent.model)
-    const modelLine = agent.model
-      ? `\n\nDefault model for this Raptor session is now \`${agent.model}\`.`
-      : `\n\nDefault model for this Raptor session is now the configured fallback \`${getConfiguredFallbackModel()}\`.`
-    stream.markdown(`Switched to agent **${agent.name ?? agent.id}** (${agent.description ?? 'no description'}).${modelLine}`)
-    return { metadata: { activeAgent: agent.id, activeModel: agent.model ?? null } }
+    const task = rest.join(' ').trim()
+    if (!task) {
+      const tools = agent.tools === null ? 'all' : (agent.tools?.join(', ') ?? 'all')
+      stream.markdown([
+        `## Agent: ${agent.name ?? agent.id}`,
+        '',
+        `**ID:** \`${agent.id}\``,
+        `**Description:** ${agent.description ?? '-'} `,
+        `**Model:** ${agent.model ?? '(workspace/session default)'}`,
+        `**Tools:** ${tools}`,
+        `**Source:** ${agent.source ?? '-'}`,
+        '',
+        'Run a request-scoped task with `/agent <id> <task...>`.',
+      ].join('\n'))
+      return {}
+    }
+    requestScope = { agentId: agent.id, task, isExplicitAgentRequest: true }
+    stream.markdown(`Running **${agent.name ?? agent.id}** for this turn only.\n\n`)
   }
 
   // ── /flows — list loaded flows ────────────────────────────────────────────
@@ -2125,7 +1481,7 @@ async function handleChatRequest(
       ...rows,
       '',
       'Capabilities: `native-tools` = full tool loop, `native-text` = text only, `delegated` = CLI subprocess, `unavailable` = not configured.',
-      'Use provider-qualified model specs like `anthropic:claude-sonnet-4-20250514`, `ollama:llama3.1`, `claude-code:sonnet`.',
+      'Use provider-qualified model specs like `vscode:copilot-gpt-4`, `claude-code:sonnet`, `codex:gpt-5.3-codex`, `opencode:default`.',
     ].join('\n'))
     return {}
   }
@@ -2134,64 +1490,78 @@ async function handleChatRequest(
     const flowArgs = getCommandArgs(promptTrimmed, 'flow')
     const flowParts = flowArgs.split(/\s+/).filter(Boolean)
     const flowId = flowParts[0] ?? ''
-    const allowModelChanges = flowParts.includes('--accept-models')
-    const keepCurrentModel = flowParts.includes('--keep-current')
-    const useChat = flowParts.includes('--chat')
-    const chatIdx = flowParts.indexOf('--chat')
-    const chatModelArg = useChat && chatIdx + 1 < flowParts.length && !flowParts[chatIdx + 1].startsWith('--')
-      ? flowParts[chatIdx + 1]
-      : undefined
     const doResume = flowParts.includes('--resume')
     const doMemory = flowParts.includes('--memory')
 
     // /flow --list — show all saved flow states
     if (flowId === '--list') {
-      const states = await listFlowStates()
+      const states = await listFlowCheckpoints()
       if (states.length === 0) {
         stream.markdown('No saved flow states. States are saved automatically when a flow is interrupted.')
       } else {
         const rows = states.map(s => {
-          const status = s.status ?? 'running'
-          const progress = status === 'completed'
-            ? `${s.completedSteps} steps done`
-            : `${s.completedSteps} steps done, next step ${s.completedSteps + 1}`
-          return `| \`${s.flowId}\` | ${status} | ${progress} | ${new Date(s.updatedAt).toLocaleString()} |`
+          const progress = `${s.completedSteps} step${s.completedSteps === 1 ? '' : 's'} done`
+          const note = s.failureReason ? ` — ${s.failureReason}` : ''
+          return `| \`${s.flowId}\` | ${s.status} | ${progress} | ${new Date(s.updatedAt).toLocaleString()} |${note}`
         })
         stream.markdown([
           '## Saved flow states',
           '',
-          '| Flow | Status | Progress | Last updated |',
-          '|---|---|---|---|',
+          '| Flow | Status | Progress | Last updated | Notes |',
+          '|---|---|---|---|---|',
           ...rows,
           '',
-          'Resume incomplete flows with `/flow <id> --resume`. View summary with `/flow <id> --memory`.',
+          'Resume incomplete flows with `/flow <id> --resume`. View checkpoint details with `/flow <id> --memory`.',
         ].join('\n'))
       }
       return {}
     }
 
     if (!flowId) {
-      stream.markdown('Usage: `/flow <id> [--resume] [--accept-models] [--keep-current] [--chat]` — run a flow. `/flow --list` lists saved states. `/flow <id> --memory` shows a flow\'s saved summary.')
+      const flows = Array.from(loaded.flows.values())
+      if (flows.length === 0) {
+        stream.markdown('No flows loaded. Define flows in `~/.raptor/flows.yaml` or a workspace `.raptor/` directory.')
+        return {}
+      }
+      const rows = flows.map(f => {
+        const stepsPreview = f.steps.map((s, i) => `${i + 1}. ${s.agent}`).join(' → ')
+        return `| \`${f.id}\` | ${f.name ?? f.id} | ${f.description ?? '-'} | ${f.steps.length} | ${stepsPreview} |`
+      })
+      stream.markdown([
+        '## Available Flows',
+        '',
+        '| ID | Name | Description | Steps | Pipeline |',
+        '|---|---|---|---|---|',
+        ...rows,
+        '',
+        'Click a follow-up button below or type `/flow <id>` to run one.',
+      ].join('\n'))
       return {}
     }
 
     // /flow <id> --memory — show persisted summary for this flow
     if (doMemory) {
-      const saved = await loadFlowState(flowId)
+      const saved = await loadLatestFlowCheckpoint(flowId)
       if (!saved) {
         stream.markdown(`No saved state for flow \`${flowId}\`.`)
       } else {
         stream.markdown([
           `## Flow memory: \`${saved.flowId}\``,
           '',
-          `**Status:** ${saved.status ?? 'running'}`,
+          `**Run ID:** ${saved.runId}`,
+          `**Status:** ${saved.status}`,
           `**Progress:** ${saved.completedSteps} steps completed`,
+          `**Fingerprint:** \`${saved.configFingerprint}\``,
           `**Started:** ${new Date(saved.startedAt).toLocaleString()}`,
           `**Updated:** ${new Date(saved.updatedAt).toLocaleString()}`,
           '',
           '### Step summaries',
           '',
           saved.stepSummary || '_(no summary)_',
+          '',
+          '### Artifacts',
+          '',
+          ...saved.steps.map(step => `- Step ${step.index + 1}: \`${step.artifactPath}\` (${step.status})`),
         ].join('\n'))
       }
       return {}
@@ -2202,91 +1572,65 @@ async function handleChatRequest(
       stream.markdown(`Flow "${flowId}" not found. Use \`/flows\` to list available flows.`)
       return {}
     }
-    const currentAgent = loaded.agents.get(inferActiveAgent(chatContext)) ?? loaded.agents.get('_default')!
-    const currentModelSpec = currentAgent.model ?? inferActiveModel(chatContext) ?? getConfiguredFallbackModel()
-    if (!allowModelChanges && !keepCurrentModel && !useChat) {
-      const modelChanges = collectFlowModelChanges(flow, loaded, currentModelSpec)
-      if (modelChanges.length > 0) {
-        const rows = modelChanges.map(change =>
-          `| ${change.step} | \`${change.agent}\` | \`${change.from}\` | \`${change.to}\` |`
-        )
-        const chatModelLabel = request.model ? `\`${request.model.id}\`` : 'the current chat model'
+    const preflight = await preflightFlow(flow, loaded)
+    const saved = doResume ? await loadLatestFlowCheckpoint(flow.id) : null
+    if (doResume) {
+      if (!saved) {
+        stream.markdown(`No incomplete saved state for flow "${flow.id}". Run \`/flow ${flow.id}\` to start fresh.`)
+        return {}
+      }
+      if (saved.status === 'completed' || saved.completedSteps >= flow.steps.length) {
         stream.markdown([
-          `Flow **${flow.name ?? flow.id}** wants to change models between steps.`,
+          `Flow **${flow.name ?? flow.id}** already completed (${saved.completedSteps}/${flow.steps.length} steps).`,
           '',
-          '| Step | Agent | Current/Previous | Requested |',
-          '|---|---|---|---|',
-          ...rows,
-          '',
-          `Reply with \`/flow ${flow.id} --accept-models\` to use the flow's configured models, \`/flow ${flow.id} --keep-current\` to run every step with \`${currentModelSpec}\`, or \`/flow ${flow.id} --chat\` to use ${chatModelLabel} for all steps.`,
-          `Add \`--autopilot\` to skip between-step confirmations.`,
+          `Run \`/flow ${flow.id} --memory\` to inspect the saved checkpoint, or run \`/flow ${flow.id}\` to start a fresh execution.`,
         ].join('\n'))
         return {}
       }
-    }
-    let resumeFromStep: number | undefined
-    let resumedSummary: string | undefined
-    let resumedOriginalPrompt: string | undefined
-    if (doResume) {
-      const saved = await loadFlowState(flow.id)
-      if (saved) {
-        if ((saved.status ?? 'running') === 'completed' || saved.completedSteps >= flow.steps.length) {
-          stream.markdown([
-            `Flow **${flow.name ?? flow.id}** already completed (${saved.completedSteps}/${flow.steps.length} steps).`,
-            '',
-            `Run \`/flow ${flow.id} --memory\` to inspect the saved summary, or run \`/flow ${flow.id} --chat\` to start a fresh execution.`,
-          ].join('\n'))
-          return {}
-        }
-        resumeFromStep = saved.completedSteps
-        resumedSummary = saved.stepSummary
-        resumedOriginalPrompt = saved.originalPrompt
-        stream.markdown(`> ↩ Resuming **${flow.name ?? flow.id}** from step ${resumeFromStep + 1} (${flow.steps.length - resumeFromStep} remaining)\n\n`)
-      } else {
-        stream.markdown(`No incomplete saved state for flow "${flow.id}". Run \`/flow ${flow.id} --chat\` to start fresh.`)
+      if (saved.configFingerprint !== preflight.configFingerprint) {
+        stream.markdown([
+          `Saved checkpoint for flow **${flow.name ?? flow.id}** is stale after config changes.`,
+          '',
+          `Run \`/flow ${flow.id}\` to start a fresh execution instead of resuming an old fingerprint.`,
+        ].join('\n'))
         return {}
       }
+      stream.markdown(`> ↩ Resuming **${flow.name ?? flow.id}** from step ${saved.completedSteps + 1} (${flow.steps.length - saved.completedSteps} remaining)\n\n`)
     }
-    await runFlow(flow, loaded, request, chatContext, stream, token, {
-      allowModelChanges,
-      keepCurrentModel,
-      useChat,
-      chatModel: chatModelArg,
-      currentModelSpec,
-      resumeFromStep,
-      resumedSummary,
-      originalPrompt: doResume ? resumedOriginalPrompt : request.prompt,
+    await runDeterministicFlow(flow, loaded, request, chatContext, stream, token, {
+      preflight,
+      resumeState: saved ?? undefined,
+      originalPrompt: request.prompt,
     })
     return {}
   }
 
-  // ── Determine active agent from history metadata ──────────────────────────
-  const activeAgentId = inferActiveAgent(chatContext)
-  const activeAgent = loaded.agents.get(activeAgentId) ?? loaded.agents.get('_default')!
-  setActiveAgent(activeAgent.id)
-  setActiveModelSpec(activeAgent.model ?? inferActiveModel(chatContext))
-  const requestedModelSpec = activeAgent.model ?? getActiveModelSpec()
+  const effectiveAgent = requestScope
+    ? loaded.agents.get(requestScope.agentId) ?? loaded.agents.get('_default')!
+    : loaded.agents.get('_default')!
+  const effectivePrompt = requestScope?.task?.trim() ? requestScope.task.trim() : request.prompt
+  const effectiveRequest = effectivePrompt === request.prompt
+    ? request
+    : ({ ...request, prompt: effectivePrompt } as vscode.ChatRequest)
 
   let resolved: ResolvedModel
   try {
     resolved = await getRegistry().resolve({
-      agentModel: requestedModelSpec,
-      sessionModel: request.model ? { providerId: 'vscode', modelId: request.model.id } : undefined,
+      agentModel: effectiveAgent.model,
       fallbackModel: getConfiguredFallbackModel(),
     })
   } catch (err) {
     const errMsg = err instanceof ProviderError ? err.message : String(err)
-    stream.markdown(`No chat model available: ${errMsg}\n\nInstall/configure a chat model provider (Copilot, Ollama, etc.) and sign in if required.`)
+    stream.markdown(`No chat model available: ${errMsg}\n\nInstall/configure a supported provider (VS Code, Claude Code, Codex, or OpenCode) and sign in if required.`)
     return {}
   }
 
-  // ── Build messages + inject memory ─────────────────────────────────────────
-  const messages = await buildMessages(chatContext, request, activeAgent, loaded)
+  const messages = await buildMessages(chatContext, effectiveRequest, effectiveAgent, loaded)
   if (request.command === 'build-flow') {
-    injectBuildFlowCommand(messages)
+    injectBuildFlowCommand(messages, effectivePrompt)
   }
   const allToolNames = getToolDefs().map(t => t.name)
-  const allowedToolNames = filterToolsByAgent(allToolNames, activeAgent.tools)
+  const allowedToolNames = filterToolsByAgent(allToolNames, effectiveAgent.tools)
   const requestedTools = getToolDefs().filter(t => allowedToolNames.includes(t.name))
   const tools = resolved.provider.supportsTools(resolved.model) ? requestedTools : []
 
@@ -2303,19 +1647,6 @@ async function handleChatRequest(
     if (token.isCancellationRequested) break
     iteration++
 
-    // ── Drain steering buffer ───────────────────────────────────────────────
-    const steered = drainSteering()
-    if (steered.length > 0) {
-      const combined = steered.join('\n\n')
-      messages.push({
-        role: 'user',
-        content: [{ type: 'text', value: `[USER STEERING -- mid-session guidance, follow this immediately]\n${combined}` }],
-      })
-      stream.markdown(`\n> **Steering injected:** ${combined}\n\n`)
-      logToOutput(`[steering] Injected ${steered.length} message(s): ${combined.slice(0, 200)}`)
-    }
-
-    // ── Context compaction ──────────────────────────────────────────────────
     const tokenCount = estimateTokens(messages)
     const thresholds = compactThresholdsForModel(resolved.model)
     if (tokenCount > thresholds.full) {
@@ -2367,17 +1698,6 @@ async function handleChatRequest(
 
     const results = await executeToolCallsInOrder(toolCalls, token)
     for (const { toolCall, result } of results) {
-      if (toolCall.name === 'todoWrite') {
-        const todos = (toolCall.input as ToolInput)['todos']
-        if (Array.isArray(todos) && todos.length > 0) {
-          const lines = todos.map((t: {id?:string;content?:string;status?:string}) => {
-            const icon = t.status === 'completed' ? '\u2705' : t.status === 'in_progress' ? '\ud83d\udd04' : '\u2b1c'
-            return `${icon} ${t.content ?? t.id}`
-          })
-          stream.markdown(`\n**Tasks:**\n${lines.join('\n')}\n`)
-        }
-      }
-
       renderToolResultDropdown(stream, toolCall, result)
       logToolCallToOutput(toolCall.name, toolCall.input as Record<string, unknown>, result)
 
@@ -2390,15 +1710,6 @@ async function handleChatRequest(
       `\n\nReached maximum iterations (${MAX_ITERATIONS}). ` +
       `Task may be incomplete. Total tool calls: ${totalToolCalls}.`,
     )
-  }
-
-  // ── Post-turn: save session summary + extract memories + save history (fire-and-forget) ──
-  if (fullAssistantText.trim()) {
-    void generateSessionSummary(messages, resolved, token).then(summary => {
-      if (summary) return saveSessionSummary(summary)
-    })
-    void extractAndStoreMemories(request.prompt, fullAssistantText)
-    void saveConversationHistory(messages, totalToolCalls)
   }
 
   return {}
@@ -2420,32 +1731,12 @@ async function handleChatRequest(
  */
 // ─── Messages ─────────────────────────────────────────────────────────────────
 
-function inferActiveAgent(chatContext: vscode.ChatContext): string {
-  // Walk history backwards to find the most recent agent switch marker
-  for (let i = chatContext.history.length - 1; i >= 0; i--) {
-    const turn = chatContext.history[i]
-    if (turn instanceof vscode.ChatResponseTurn) {
-      const meta = (turn.result as vscode.ChatResult | undefined)?.metadata
-      if (meta && typeof meta === 'object' && 'activeAgent' in meta) {
-        return String((meta as Record<string, unknown>).activeAgent)
-      }
-    }
-  }
-  return getActiveAgentId()
+function inferActiveAgent(_chatContext: vscode.ChatContext): string {
+  return '_default'
 }
 
-function inferActiveModel(chatContext: vscode.ChatContext): string | undefined {
-  for (let i = chatContext.history.length - 1; i >= 0; i--) {
-    const turn = chatContext.history[i]
-    if (turn instanceof vscode.ChatResponseTurn) {
-      const meta = (turn.result as vscode.ChatResult | undefined)?.metadata
-      if (meta && typeof meta === 'object' && 'activeModel' in meta) {
-        const value = (meta as Record<string, unknown>).activeModel
-        return typeof value === 'string' && value.trim() ? value : undefined
-      }
-    }
-  }
-  return getActiveModelSpec()
+function inferActiveModel(_chatContext: vscode.ChatContext): string | undefined {
+  return undefined
 }
 
 async function buildMessages(
@@ -2454,34 +1745,18 @@ async function buildMessages(
   activeAgent: Agent,
   loaded: LoadedConfig,
 ): Promise<RaptorMessage[]> {
-  // Inject persistent memory (global + project) + workspace profile into system prompt
-  const [projectMem, wsProfile] = await Promise.all([
-    readProjectMemory(),
-    getOrBuildWorkspaceProfile(),
-  ])
+  const promptParts: string[] = []
 
-  const sections: string[] = []
-
-  if (wsProfile.trim()) {
-    sections.push(`\n\n# Workspace Profile\n${wsProfile}`)
-  }
-  if (projectMem.trim()) {
-    sections.push(`\n\n# Project Memory\nFacts specific to this workspace/project:\n\n${projectMem}`)
-  }
-
-  // Agent prompt + skills
   if (activeAgent.prompt?.trim()) {
-    sections.push(`\n\n# Agent Instructions\nYou are acting as the "${activeAgent.name ?? activeAgent.id}" agent.\n\n${activeAgent.prompt.trim()}`)
+    promptParts.push(`\n\n# Agent Instructions\nYou are acting as the "${activeAgent.name ?? activeAgent.id}" agent.\n\n${activeAgent.prompt.trim()}`)
   }
   const skillIds = activeAgent.skills ?? []
   if (skillIds.length > 0) {
     const skillText = getSkillContent(loaded.skills, skillIds)
     if (skillText.trim()) {
-      sections.push(`\n\n# Skills\n${skillText}`)
+      promptParts.push(`\n\n# Skills\n${skillText}`)
     }
   }
-
-  const memorySection = sections.join('')
 
   const root = workspaceRoot() ?? '(no workspace)'
   const promptEditor = vscode.window.activeTextEditor
@@ -2500,10 +1775,10 @@ async function buildMessages(
         platform: process.platform,
         shell: process.platform === 'win32'
           ? 'cmd.exe (Windows). Use standard CMD syntax: && to chain, & for parallel, | for pipe. For PowerShell-specific commands, use: powershell -Command "..."'
-          : process.env.SHELL ?? 'unknown',
+        : process.env.SHELL ?? 'unknown',
         dataDir: raptorDataDir(),
         tempDir: extensionTempDir(),
-      }) + memorySection }],
+      }) + promptParts.join('') }],
     },
   ]
 
@@ -2549,12 +1824,18 @@ async function buildMessages(
 
 // ─── Commands ──────────────────────────────────────────────────────────────────
 
-function injectBuildFlowCommand(messages: RaptorMessage[]): void {
+function injectBuildFlowCommand(messages: RaptorMessage[], userPrompt: string): void {
+  const goal = userPrompt.trim()
   const instruction = [
     '',
     '[COMMAND: /build-flow]',
     'Follow the agent-flow-builder skill process now.',
-    'Start with Phase 1: read .raptor/agents.json and .raptor/flows.json using readFile; treat missing files as empty arrays.',
+    'Use `.raptor/agents/*.md` plus `.raptor/flows.yaml` as the canonical workspace config, with `~/.raptor/agents/*.md` and `~/.raptor/flows.yaml` as the global fallback.',
+    'Do not prefer `.json` config files unless you are explicitly migrating a missing YAML/Markdown setup.',
+    goal
+      ? `Treat this request as the workflow goal: ${goal}`
+      : 'No extra details were provided, so use sensible defaults for any omitted model, tools, or step settings and then ask the Phase 2 interview questions.',
+    'Do not require flags to proceed. If the user omitted model or tool scope, infer reasonable defaults and explain them in the draft.',
     'Then continue to Phase 2 and interview the user in one message.',
   ].join('\n')
 
@@ -2572,10 +1853,7 @@ function injectBuildFlowCommand(messages: RaptorMessage[]): void {
 }
 
 function registerCommands(context: vscode.ExtensionContext): void {
-  registerCommandsModule(context, {
-    workspaceRoot,
-    pushSteering,
-  })
+  registerCommandsModule(context)
 }
 
 // ─── Flow runner ───────────────────────────────────────────────────────────────
@@ -2583,7 +1861,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
 const localModelQueue = new Map<string, Promise<unknown>>()
 
 async function acquireLocalModel(model: RaptorModel): Promise<() => void> {
-  const isLocal = model.providerId === 'ollama' || /local/i.test(model.id) || /local/i.test(model.name)
+  const isLocal = /local/i.test(model.id) || /local/i.test(model.name)
   if (!isLocal) return () => {}
 
   const key = model.id
@@ -2853,7 +2131,7 @@ async function runFlow(
         fallbackModel: getConfiguredFallbackModel(),
       })
     } catch (err) {
-      stream.markdown(`\n❌ Step ${i + 1} (${agent.name ?? agent.id}): no model available.\n\nConfigured model: \`${modelSpec ?? 'none'}\`. Enable a provider (Anthropic, Ollama, OpenRouter) or remove the model spec from the agent/step.\n\n> Check raptor Settings → \`raptor.providers.enabled\``)
+      stream.markdown(`\n❌ Step ${i + 1} (${agent.name ?? agent.id}): no model available.\n\nConfigured model: \`${modelSpec ?? 'none'}\`. Enable a supported provider (VS Code, Claude Code, Codex, or OpenCode) or remove the model spec from the agent/step.\n\n> Check raptor Settings → \`raptor.providers.enabled\``)
       return
     }
 
@@ -3016,6 +2294,437 @@ async function runFlow(
     originalPrompt: originalPromptContext,
     startedAt,
     updatedAt: new Date().toISOString(),
+  })
+  stream.markdown(`\n✅ Flow **${flow.name ?? flow.id}** completed.`)
+  logToOutput(`[flow] "${flow.id}" completed`)
+}
+
+interface FlowCheckpointStepState {
+  index: number
+  agentId: string
+  instructionDigest: string
+  resolvedProvider: string
+  resolvedModel: string
+  requestedTools: string[]
+  artifactPath: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  startedAt?: string
+  updatedAt?: string
+}
+
+interface FlowCheckpointState {
+  flowId: string
+  runId: string
+  status: 'running' | 'completed' | 'failed'
+  completedSteps: number
+  failedStepIndex?: number
+  failureReason?: string
+  configFingerprint: string
+  originalPrompt?: string
+  startedAt: string
+  updatedAt: string
+  stepSummary: string
+  steps: FlowCheckpointStepState[]
+}
+
+interface FlowExecutionPlanStep {
+  index: number
+  step: Flow['steps'][number]
+  agent: Agent
+  modelSpec: string
+  resolved: ResolvedModel
+  requestedTools: vscode.LanguageModelChatTool[]
+  instructionDigest: string
+}
+
+interface FlowExecutionPlan {
+  flowId: string
+  configFingerprint: string
+  steps: FlowExecutionPlanStep[]
+}
+
+function flowStateRootDir(): string {
+  const ws = workspaceRoot()
+  const base = ws ? path.join(ws, '.raptor') : raptorDataDir()
+  return path.join(base, 'flow-state')
+}
+
+function flowCheckpointRunDir(flowId: string, runId: string): string {
+  return path.join(flowStateRootDir(), flowId, runId)
+}
+
+function flowLatestCheckpointPath(flowId: string): string {
+  return path.join(flowStateRootDir(), flowId, 'latest.json')
+}
+
+function computeFlowFingerprint(flow: Flow, loaded: LoadedConfig): string {
+  const payload = {
+    flow,
+    agentSources: Array.from(loaded.agents.values()).map(agent => ({
+      id: agent.id,
+      source: agent.source ?? null,
+      model: agent.model ?? null,
+      skills: agent.skills ?? null,
+      tools: agent.tools ?? null,
+    })),
+    skillSources: Array.from(loaded.skills.values()).map(skill => ({
+      id: skill.id,
+      source: skill.source,
+    })),
+    signature: loaded.signature ?? '',
+  }
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0, 16)
+}
+
+function createInstructionDigest(text: string): string {
+  return createHash('sha256').update(text).digest('hex').slice(0, 12)
+}
+
+function createRunId(): string {
+  return `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`
+}
+
+async function writeFlowCheckpoint(state: FlowCheckpointState): Promise<void> {
+  const runDir = flowCheckpointRunDir(state.flowId, state.runId)
+  const latestPath = flowLatestCheckpointPath(state.flowId)
+  try {
+    await fs.mkdir(runDir, { recursive: true })
+    await fs.mkdir(path.dirname(latestPath), { recursive: true })
+    await fs.writeFile(path.join(runDir, 'state.json'), JSON.stringify(state, null, 2), 'utf-8')
+    await fs.writeFile(latestPath, JSON.stringify({
+      flowId: state.flowId,
+      runId: state.runId,
+      updatedAt: state.updatedAt,
+      status: state.status,
+      statePath: path.join(runDir, 'state.json'),
+    }, null, 2), 'utf-8')
+  } catch (err) {
+    logToOutput(`[flow-state] Failed to write checkpoint for "${state.flowId}": ${String(err)}`)
+  }
+}
+
+async function loadFlowCheckpoint(flowId: string, runId: string): Promise<FlowCheckpointState | null> {
+  try {
+    const raw = await fs.readFile(path.join(flowCheckpointRunDir(flowId, runId), 'state.json'), 'utf-8')
+    return JSON.parse(raw) as FlowCheckpointState
+  } catch {
+    return null
+  }
+}
+
+async function loadLatestFlowCheckpoint(flowId: string): Promise<FlowCheckpointState | null> {
+  try {
+    const latestRaw = await fs.readFile(flowLatestCheckpointPath(flowId), 'utf-8')
+    const latest = JSON.parse(latestRaw) as { runId?: string; statePath?: string }
+    if (!latest.runId) return null
+    const state = await loadFlowCheckpoint(flowId, latest.runId)
+    return state
+  } catch {
+    return null
+  }
+}
+
+async function listFlowCheckpoints(): Promise<FlowCheckpointState[]> {
+  try {
+    const root = flowStateRootDir()
+    const flowDirs = await fs.readdir(root, { withFileTypes: true })
+    const states: FlowCheckpointState[] = []
+    for (const flowDir of flowDirs) {
+      if (!flowDir.isDirectory()) continue
+      const state = await loadLatestFlowCheckpoint(flowDir.name)
+      if (state) states.push(state)
+    }
+    return states.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  } catch {
+    return []
+  }
+}
+
+async function preflightFlow(flow: Flow, loaded: LoadedConfig): Promise<FlowExecutionPlan> {
+  const fingerprint = computeFlowFingerprint(flow, loaded)
+  const allToolNames = getToolDefs().map(tool => tool.name)
+  const steps: FlowExecutionPlanStep[] = []
+
+  for (let i = 0; i < flow.steps.length; i++) {
+    const step = flow.steps[i]
+    const agent = loaded.agents.get(step.agent) ?? loaded.agents.get('_default')!
+    const modelSpec = step.model ?? agent.model ?? getConfiguredFallbackModel()
+    const resolved = await getRegistry().resolve({
+      flowStepModel: modelSpec,
+      fallbackModel: getConfiguredFallbackModel(),
+    })
+    const allowedToolNames = filterToolsByAgent(allToolNames, step.tools ?? agent.tools)
+    const requestedTools = getToolDefs().filter(tool => allowedToolNames.includes(tool.name))
+    if (requestedTools.length > 0 && !resolved.provider.supportsTools(resolved.model)) {
+      throw new Error(toolCapabilityError(resolved.provider.id, resolved.model.id, requestedTools.length))
+    }
+    steps.push({
+      index: i,
+      step,
+      agent,
+      modelSpec,
+      resolved,
+      requestedTools,
+      instructionDigest: createInstructionDigest(step.instruction),
+    })
+  }
+
+  return {
+    flowId: flow.id,
+    configFingerprint: fingerprint,
+    steps,
+  }
+}
+
+async function runDeterministicFlow(
+  flow: Flow,
+  loaded: LoadedConfig,
+  request: vscode.ChatRequest,
+  chatContext: vscode.ChatContext,
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+  options: {
+    preflight: FlowExecutionPlan
+    resumeState?: FlowCheckpointState
+    originalPrompt?: string
+  },
+): Promise<void> {
+  const startedAt = options.resumeState?.startedAt ?? new Date().toISOString()
+  const runId = options.resumeState?.runId ?? createRunId()
+  const resumeFrom = options.resumeState?.completedSteps ?? 0
+  const stepSummarySeed = options.resumeState?.stepSummary ?? ''
+  const originalPromptContext = options.originalPrompt?.trim()
+  const shouldAttachOriginalPrompt = !!originalPromptContext && !isFlowCommandPrompt(originalPromptContext)
+  let stepSummary = stepSummarySeed
+
+  if (!options.resumeState) {
+    stream.markdown(`**Starting flow: ${flow.name ?? flow.id}** (${flow.steps.length} steps)\n\n`)
+    logToOutput(`[flow] Starting "${flow.id}" with ${flow.steps.length} steps`)
+  }
+
+  const checkpointSteps: FlowCheckpointStepState[] = options.preflight.steps.map(step => ({
+    index: step.index,
+    agentId: step.agent.id,
+    instructionDigest: step.instructionDigest,
+    resolvedProvider: step.resolved.provider.id,
+    resolvedModel: step.resolved.model.id,
+    requestedTools: step.requestedTools.map(tool => tool.name),
+    artifactPath: path.join(flowCheckpointRunDir(flow.id, runId), `step-${step.index + 1}.md`),
+    status: step.index < resumeFrom ? 'completed' : 'pending',
+    startedAt: step.index < resumeFrom ? startedAt : undefined,
+    updatedAt: step.index < resumeFrom ? startedAt : undefined,
+  }))
+
+  if (!options.resumeState) {
+    await writeFlowCheckpoint({
+      flowId: flow.id,
+      runId,
+      status: 'running',
+      completedSteps: 0,
+      configFingerprint: options.preflight.configFingerprint,
+      originalPrompt: originalPromptContext,
+      startedAt,
+      updatedAt: new Date().toISOString(),
+      stepSummary,
+      steps: checkpointSteps,
+    })
+  }
+
+  for (const planStep of options.preflight.steps) {
+    if (token.isCancellationRequested) {
+      stream.markdown('\n_Flow cancelled by user._\n')
+      return
+    }
+
+    if (planStep.index < resumeFrom) {
+      stream.markdown(`~~Step ${planStep.index + 1}~~ _(resumed — skipped)_\n`)
+      continue
+    }
+
+    const step = planStep.step
+    const agent = planStep.agent
+    const stepAgent: Agent = {
+      ...agent,
+      model: planStep.modelSpec,
+      skills: step.skills ?? agent.skills,
+      tools: step.tools ?? agent.tools,
+    }
+    const stepArtifactPath = checkpointSteps[planStep.index].artifactPath
+    const stepStartedAt = new Date().toISOString()
+
+    stream.markdown(`**Step ${planStep.index + 1}/${flow.steps.length}** — ${agent.name ?? agent.id} \`${planStep.resolved.provider.id}:${planStep.resolved.model.id}\`\n`)
+    logToOutput(`[flow] Step ${planStep.index + 1}: agent=${step.agent}, requested=${planStep.modelSpec}, resolved=${planStep.resolved.provider.id}:${planStep.resolved.model.id}`)
+
+    const release = await acquireLocalModel(planStep.resolved.model)
+    try {
+      const messages = await buildMessages(chatContext, request, stepAgent, loaded)
+      const lastUser = messages[messages.length - 1]
+      if (lastUser && lastUser.role === 'user') {
+        const budget = step.summaryBudget ?? 2000
+        const summaryPrefix = stepSummary
+          ? `[Previous steps summary (max ${budget} chars):\n${stepSummary.slice(0, budget)}\n]\n\n`
+          : ''
+        const originalContext = shouldAttachOriginalPrompt
+          ? `\n\n[Original user request context: ${originalPromptContext}]`
+          : ''
+        const newContent = `${summaryPrefix}${step.instruction}${originalContext}`
+        messages[messages.length - 1] = { role: 'user', content: [{ type: 'text', value: newContent }] }
+      }
+
+      const tools = planStep.requestedTools
+      const capNote = tools.length === 0 ? ' (text-only)' : ''
+      stream.progress(`raptor -> ${planStep.resolved.model.name} (${planStep.resolved.source}; step ${planStep.index + 1}${contextWindowNote(planStep.resolved.model)}${capNote})`)
+
+      let stepText = ''
+      let iteration = 0
+      let stepToolCalls = 0
+      const maxIterations = getConfig().maxIterations
+      const thresholds = compactThresholdsForModel(planStep.resolved.model)
+
+      while (iteration < maxIterations) {
+        if (token.isCancellationRequested) break
+        iteration++
+
+        const tokenCount = estimateTokens(messages)
+        if (tokenCount > thresholds.full) {
+          stream.progress(`Flow step ${planStep.index + 1} context full (${tokenCount.toLocaleString()} tokens) -- compacting...`)
+          const compacted = await fullCompactMessages(messages, planStep.resolved, token)
+          messages.length = 0
+          messages.push(...compacted)
+        } else if (tokenCount > thresholds.micro) {
+          const compacted = microCompactMessages(messages)
+          messages.length = 0
+          messages.push(...compacted)
+        }
+
+        const responseStream = await planStep.resolved.provider.sendRequest(planStep.resolved.model, messages, { tools }, token)
+        const textParts: RaptorTextPart[] = []
+        const toolCalls: RaptorToolCallPart[] = []
+
+        for await (const part of responseStream) {
+          if (token.isCancellationRequested) break
+          if (part.type === 'text') {
+            textParts.push({ type: 'text', value: part.value })
+            stepText += part.value
+            stream.markdown(part.value)
+          } else if (part.type === 'tool_call') {
+            toolCalls.push({ type: 'tool_call', callId: part.callId, name: part.name, input: part.input })
+          }
+        }
+
+        if (token.isCancellationRequested) break
+        if (toolCalls.length === 0) break
+
+        appendToolResult(messages, textParts, toolCalls)
+
+        stepToolCalls += toolCalls.length
+        const callSummary = toolCalls.map(c => `${c.name}(${summariseInput(c.input)})`).join(', ')
+        stream.progress(`[flow step ${planStep.index + 1} iter ${iteration}] ${callSummary}`)
+
+        const results = await executeToolCallsInOrder(toolCalls, token)
+        for (const { toolCall, result } of results) {
+          renderToolResultDropdown(stream, toolCall, result)
+          logToolCallToOutput(toolCall.name, toolCall.input as Record<string, unknown>, result)
+          appendToolResultToMessages(messages, toolCall.callId, result)
+        }
+      }
+
+      if (iteration >= maxIterations) {
+        stream.markdown(`\n\nStep ${planStep.index + 1} reached maximum iterations (${maxIterations}). Task may be incomplete.`)
+      }
+
+      if (!stepText.trim() && stepToolCalls === 0) {
+        stream.markdown(`\n⚠️ Step ${planStep.index + 1} produced no output. Check the raptor Output channel for details. Continuing...`)
+      }
+      if (stepToolCalls === 0 && looksLikeHallucinatedToolExecution(stepText)) {
+        throw new Error(
+          `Step ${planStep.index + 1} described tool results in text but made no real tool calls. Flow aborted so fake edits/plans are not treated as completed work.`,
+        )
+      }
+      if (stepRequiresPlanArtifact(step, agent)) {
+        const planFile = await newestPlanFileSince(Date.parse(stepStartedAt))
+        if (!planFile) {
+          throw new Error(
+            `Planner step ${planStep.index + 1} did not create a real .plans/<slug>/plan.md file in the workspace.`,
+          )
+        }
+        logToOutput(`[flow] Planner artifact created: ${shortenPath(planFile)}`)
+      }
+
+      const compact = stepText.trim().slice(0, step.summaryBudget ?? 2000)
+      stepSummary += `\n--- Step ${planStep.index + 1} (${agent.name ?? agent.id}) ---\n${compact}\n`
+      await fs.mkdir(path.dirname(stepArtifactPath), { recursive: true })
+      await fs.writeFile(stepArtifactPath, [
+        `# Step ${planStep.index + 1}: ${agent.name ?? agent.id}`,
+        '',
+        `Model: ${planStep.resolved.provider.id}:${planStep.resolved.model.id}`,
+        '',
+        stepText.trim() || '_No textual output_',
+      ].join('\n'), 'utf-8')
+
+      checkpointSteps[planStep.index] = {
+        ...checkpointSteps[planStep.index],
+        status: 'completed',
+        startedAt: checkpointSteps[planStep.index].startedAt ?? stepStartedAt,
+        updatedAt: new Date().toISOString(),
+      }
+
+      await writeFlowCheckpoint({
+        flowId: flow.id,
+        runId,
+        status: 'running',
+        completedSteps: planStep.index + 1,
+        configFingerprint: options.preflight.configFingerprint,
+        originalPrompt: originalPromptContext,
+        startedAt,
+        updatedAt: new Date().toISOString(),
+        stepSummary,
+        steps: checkpointSteps,
+      })
+    } catch (err) {
+      checkpointSteps[planStep.index] = {
+        ...checkpointSteps[planStep.index],
+        status: 'failed',
+        startedAt: checkpointSteps[planStep.index].startedAt ?? stepStartedAt,
+        updatedAt: new Date().toISOString(),
+      }
+      await writeFlowCheckpoint({
+        flowId: flow.id,
+        runId,
+        status: 'failed',
+        completedSteps: planStep.index,
+        failedStepIndex: planStep.index,
+        failureReason: String(err),
+        configFingerprint: options.preflight.configFingerprint,
+        originalPrompt: originalPromptContext,
+        startedAt,
+        updatedAt: new Date().toISOString(),
+        stepSummary,
+        steps: checkpointSteps,
+      })
+      stream.markdown(`\n❌ Step ${planStep.index + 1} failed: ${String(err)}. Flow aborted.\n\n> Use \`/flow ${flow.id} --resume\` to retry from this step.`)
+      logToOutput(`[flow] Step ${planStep.index + 1} error: ${String(err)}`)
+      return
+    } finally {
+      release()
+    }
+  }
+
+  await writeFlowCheckpoint({
+    flowId: flow.id,
+    runId,
+    status: 'completed',
+    completedSteps: flow.steps.length,
+    configFingerprint: options.preflight.configFingerprint,
+    originalPrompt: originalPromptContext,
+    startedAt,
+    updatedAt: new Date().toISOString(),
+    stepSummary,
+    steps: checkpointSteps.map(step => ({
+      ...step,
+      status: 'completed',
+      updatedAt: new Date().toISOString(),
+    })),
   })
   stream.markdown(`\n✅ Flow **${flow.name ?? flow.id}** completed.`)
   logToOutput(`[flow] "${flow.id}" completed`)

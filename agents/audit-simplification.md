@@ -1,7 +1,11 @@
 ---
 name: audit-simplification
 description: Simplification & readability specialist for hawk-skills code audits. Flags long functions, deep nesting, dead code, duplication, and proposes concrete simpler versions. Used internally by hawk-skills audit fan-out — not intended for direct invocation.
-tools: Read, Grep, Glob, Bash
+permission:
+  read: allow
+  grep: allow
+  glob: allow
+  bash: allow
 model: sonnet
 ---
 

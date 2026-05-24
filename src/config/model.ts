@@ -76,23 +76,15 @@ export function pickModelByVendorAndId(
 ): vscode.LanguageModelChat | undefined {
   const norm = normalizeModelToken(spec)
 
-  const fullExact = models.find(model =>
-    modelTokens(model).some(value => value === norm),
-  )
-  if (fullExact) return fullExact
-
-  const fullPartial = models.find(model =>
-    modelTokens(model).some(value => value.includes(norm) || norm.includes(value)),
-  )
-  if (fullPartial) return fullPartial
-
-  // Support vendor:model syntax, e.g. "ollama:llama3.1" or "openrouter:anthropic/claude-3.5-sonnet"
+  // Support vendor:model syntax, e.g. "claude-code:sonnet" or "codex:gpt-5.3-codex"
   const vendorSplit = norm.split(':')
   const vendorHint = vendorSplit.length > 1 ? vendorSplit[0] : undefined
   const modelHint = vendorSplit.length > 1 ? vendorSplit.slice(1).join(':') : norm
   const candidates = vendorHint
     ? models.filter(m => normalizeModelToken(m.vendor) === vendorHint)
     : [...models]
+
+  if (!modelHint) return undefined
 
   // Exact match on id/family/name first. When a vendor was specified, do not
   // allow an identically named model from a different provider to win.

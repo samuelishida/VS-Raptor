@@ -106,8 +106,10 @@ export function resolvePath(inputPath: string): string {
   }
 
   if (root) {
-    const joined = path.join(root, cleaned)
-    if (cleaned !== path.basename(cleaned)) return joined
+    const normalizedRoot = path.normalize(root)
+    const candidate = path.resolve(normalizedRoot, cleaned)
+    if (isInsidePath(candidate, normalizedRoot)) return candidate
+    throw new Error(`Path "${cleaned}" is outside the workspace "${normalizedRoot}". Use a workspace-relative path.`)
   }
 
   const activeFile = vscode.window.activeTextEditor?.document.fileName

@@ -1,7 +1,11 @@
 ---
 name: audit-logic
 description: Logic & edge-case specialist for hawk-skills code audits. Reviews diffs for off-by-one errors, null/undefined/NaN, empty inputs, concurrency, ordering assumptions, error paths, and boundary values. Used internally by hawk-skills audit fan-out — not intended for direct invocation.
-tools: Read, Grep, Glob, Bash
+permission:
+  read: allow
+  grep: allow
+  glob: allow
+  bash: allow
 model: sonnet
 ---
 

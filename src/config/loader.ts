@@ -1,9 +1,14 @@
 import * as fs from 'fs/promises'
+import * as os from 'os'
 import * as path from 'path'
 import { workspaceRoot } from '../utils/paths'
 import { loadOpenCodeConfig } from './importers/opencode'
 import { loadClaudeConfig } from './importers/claude'
 import { loadCodexConfig } from './importers/codex'
+import {
+  collectCollectionSignatureEntries,
+  readConfigCollection,
+} from './serde'
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
@@ -22,6 +27,14 @@ export interface Agent {
   tools?: string[] | null
   model?: string
   source?: string
+}
+
+export interface ImportedConfig {
+  origin: 'claude' | 'codex' | 'opencode'
+  sources: string[]
+  agents: Agent[]
+  flows: Flow[]
+  warnings: string[]
 }
 
 export interface FlowStep {
@@ -45,16 +58,16 @@ export interface LoadedConfig {
   skills: Map<string, Skill>
   agents: Map<string, Agent>
   flows: Map<string, Flow>
+  imports: ImportedConfig[]
   warnings: string[]
   sources: string[]
+  signature?: string
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const WORKSPACE_ROOT_NAMES = ['.raptor', '.opencode', '.claude', '.codex', '.github'] as const
 const SKILL_FILE = 'skills.md'
-const AGENTS_FILE = 'agents.json'
-const FLOWS_FILE = 'flows.json'
 
 // ─── Config cache with signature-based freshness tracking ──────────────
 // Race condition note: Multiple concurrent requests could theoretically
@@ -73,8 +86,8 @@ interface CacheEntry {
 let configCache: CacheEntry | null = null
 
 function raptorDataDir(): string {
-  const home = process.env.USERPROFILE || process.env.HOME || require('os').homedir()
-  return path.join(home || require('os').tmpdir(), '.raptor')
+  const home = process.env.USERPROFILE || process.env.HOME || os.homedir()
+  return path.join(home || os.tmpdir(), '.raptor')
 }
 
 // ─── Discovery ─────────────────────────────────────────────────────────────────
@@ -120,15 +133,53 @@ async function collectSkillSignatureEntries(skillsDir: string): Promise<string[]
   return entriesForSignature
 }
 
+async function collectAgentMarkdownSignatureEntries(agentsDir: string): Promise<string[]> {
+  const entriesForSignature: string[] = []
+  try {
+    const entries = await fs.readdir(agentsDir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue
+      const agentPath = path.join(agentsDir, entry.name)
+      const m = await fileMtime(agentPath)
+      entriesForSignature.push(`${agentPath}:${m ?? 'missing'}`)
+    }
+  } catch {
+    entriesForSignature.push(`${agentsDir}:missing`)
+  }
+  return entriesForSignature
+}
+
+async function collectImportedSignatureEntries(root: string): Promise<string[]> {
+  const entries: string[] = []
+  const rootName = path.basename(root)
+  const importedFiles =
+    rootName === '.claude'
+      ? ['CLAUDE.md', 'settings.json']
+      : rootName === '.codex'
+        ? ['config.toml', 'instructions.md']
+        : []
+
+  for (const file of importedFiles) {
+    const filePath = path.join(root, file)
+    entries.push(`${filePath}:${await fileMtime(filePath) ?? 'missing'}`)
+  }
+
+  return entries
+}
+
 async function computeConfigSignature(roots: string[]): Promise<string> {
   const entries: string[] = []
 
   for (const root of roots) {
-    for (const file of [SKILL_FILE, AGENTS_FILE, FLOWS_FILE]) {
+    for (const file of [SKILL_FILE]) {
       const filePath = path.join(root, file)
       entries.push(`${filePath}:${await fileMtime(filePath) ?? 'missing'}`)
     }
+    entries.push(...await collectCollectionSignatureEntries(root, 'agents'))
+    entries.push(...await collectCollectionSignatureEntries(root, 'flows'))
+    entries.push(...await collectAgentMarkdownSignatureEntries(path.join(root, 'agents')))
     entries.push(...await collectSkillSignatureEntries(path.join(root, 'skills')))
+    entries.push(...await collectImportedSignatureEntries(root))
   }
 
   const ws = workspaceRoot()
@@ -137,25 +188,6 @@ async function computeConfigSignature(roots: string[]): Promise<string> {
   }
 
   return JSON.stringify(entries.sort())
-}
-
-async function readJsonFile<T>(
-  p: string,
-  label: string,
-  arrayKey: 'agents' | 'flows',
-): Promise<{ data: T | null; warning?: string }> {
-  try {
-    const text = await fs.readFile(p, 'utf-8')
-    const parsed = JSON.parse(text)
-    // Support both { agents: [...] } / { flows: [...] } and top-level array shapes.
-    const arr = Array.isArray(parsed) ? parsed : parsed?.[arrayKey] ?? null
-    if (arr === null) {
-      return { data: null, warning: `${label} has no recognizable array field (expected top-level array or "${arrayKey}" key).` }
-    }
-    return { data: arr as T }
-  } catch (err) {
-    return { data: null, warning: `Failed to parse ${label}: ${String(err)}` }
-  }
 }
 
 // ─── SKILL.md helpers ────────────────────────────────────────────────────────
@@ -174,6 +206,15 @@ function parseFrontmatter(text: string): { meta: Record<string, string>; body: s
   return { meta, body: lines.slice(endIdx + 1).join('\n').trimStart() }
 }
 
+function splitFrontmatterList(value: string | undefined): string[] | undefined {
+  if (!value) return undefined
+  const items = value
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean)
+  return items.length > 0 ? items : undefined
+}
+
 async function loadSkillFiles(skillsDir: string): Promise<Skill[]> {
   const skills: Skill[] = []
   try {
@@ -190,6 +231,42 @@ async function loadSkillFiles(skillsDir: string): Promise<Skill[]> {
     }
   } catch { /* dir not found */ }
   return skills
+}
+
+async function loadAgentMarkdownFiles(agentsDir: string): Promise<{ agents: Agent[]; warnings: string[] }> {
+  const agents: Agent[] = []
+  const warnings: string[] = []
+  try {
+    const entries = await fs.readdir(agentsDir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue
+      const agentPath = path.join(agentsDir, entry.name)
+      try {
+        const text = await fs.readFile(agentPath, 'utf-8')
+        const { meta, body } = parseFrontmatter(text)
+        const id = (meta['name'] ?? entry.name.replace(/\.md$/i, '')).trim()
+        if (!id) {
+          warnings.push(`Agent markdown file ${agentPath} is missing a usable id/name.`)
+          continue
+        }
+        agents.push({
+          id,
+          name: meta['title']?.trim() || meta['name']?.trim() || id,
+          description: meta['description']?.trim() || undefined,
+          prompt: body.trim() || undefined,
+          tools: splitFrontmatterList(meta['tools']),
+          skills: splitFrontmatterList(meta['skills']),
+          model: meta['model']?.trim() || undefined,
+          source: agentPath,
+        })
+      } catch (err) {
+        warnings.push(`Error reading agent markdown file ${agentPath}: ${String(err)}`)
+      }
+    }
+  } catch {
+    // Agent directory is optional.
+  }
+  return { agents, warnings }
 }
 
 // ─── Skill parser ────────────────────────────────────────────────────────────
@@ -263,12 +340,14 @@ function normalizeFlow(raw: unknown, source: string): { flow: Flow | null; warni
   }
   const rawSteps = Array.isArray(r.steps) ? r.steps : []
   const steps: FlowStep[] = []
+  let skippedSteps = 0
   for (const s of rawSteps) {
     if (!s || typeof s !== 'object') continue
     const rs = s as Record<string, unknown>
     const agent = typeof rs.agent === 'string' ? rs.agent : ''
     if (!agent) {
-      return { flow: null, warning: `Flow "${id}" has a step missing "agent" in ${source}.` }
+      skippedSteps++
+      continue
     }
     steps.push({
       agent,
@@ -279,13 +358,21 @@ function normalizeFlow(raw: unknown, source: string): { flow: Flow | null; warni
       summaryBudget: typeof rs.summaryBudget === 'number' ? rs.summaryBudget : undefined,
     })
   }
+  if (steps.length === 0) {
+    return { flow: null, warning: `Flow "${id}" in ${source} has no valid steps.` }
+  }
   const flow: Flow = {
     id,
     name: typeof r.name === 'string' ? r.name : undefined,
     description: typeof r.description === 'string' ? r.description : undefined,
     steps,
   }
-  return { flow }
+  return {
+    flow,
+    warning: skippedSteps > 0
+      ? `Flow "${id}" in ${source} skipped ${skippedSteps} invalid step${skippedSteps === 1 ? '' : 's'} missing "agent".`
+      : undefined,
+  }
 }
 
 // ─── Merge / dedupe ───────────────────────────────────────────────────────────
@@ -298,6 +385,7 @@ function mergeConfigs(
     skills: new Map(base.skills),
     agents: new Map(base.agents),
     flows: new Map(base.flows),
+    imports: [...base.imports, ...incoming.imports],
     warnings: [...base.warnings, ...incoming.warnings],
     sources: [...base.sources, ...incoming.sources],
   }
@@ -330,15 +418,16 @@ function mergeConfigs(
 
 function ensureDefaultAgent(config: LoadedConfig): void {
   if (!config.agents.has('_default')) {
-    const orchestratorSkills = ['raptor', 'agent-flow-builder'].filter(id => config.skills.has(id))
     config.agents.set('_default', {
       id: '_default',
       name: 'Raptor',
-      description: 'Agent orchestrator - routes tasks to specialist skills and builds agent flows',
-      prompt: orchestratorSkills.length > 0
-        ? `You are Raptor, an agent orchestrator. Route tasks through the loaded skills (${orchestratorSkills.join(', ')}) and help users build custom agent flows when asked.`
-        : '',
-      skills: orchestratorSkills,
+      description: 'Deterministic agent orchestrator for loaded skills, agents, and flows',
+      prompt: [
+        'You are Raptor, a deterministic orchestration layer for loaded skills, agents, and flows.',
+        'Help the user find the right skill or agent, keep responses concise, and treat agent/flow coordination as your primary job.',
+        'Prefer explicit named agents and flows over ambient session state or hidden mode switches.',
+      ].join(' '),
+      skills: [],
       tools: null,
     })
   }
@@ -357,23 +446,21 @@ export async function loadConfig(): Promise<LoadedConfig> {
     skills: new Map(builtinStart.skills),
     agents: new Map(builtinStart.agents),
     flows: new Map(builtinStart.flows),
+    imports: [],
     warnings: [...builtinStart.warnings],
     sources: [...builtinStart.sources],
   }
 
   for (const root of roots) {
     const skillPath = path.join(root, SKILL_FILE)
-    const agentsPath = path.join(root, AGENTS_FILE)
-    const flowsPath = path.join(root, FLOWS_FILE)
 
     const mtimeSkill = await fileMtime(skillPath)
-    const mtimeAgents = await fileMtime(agentsPath)
-    const mtimeFlows = await fileMtime(flowsPath)
 
     const incoming: LoadedConfig = {
       skills: new Map(),
       agents: new Map(),
       flows: new Map(),
+      imports: [],
       warnings: [],
       sources: [],
     }
@@ -392,29 +479,31 @@ export async function loadConfig(): Promise<LoadedConfig> {
       }
     }
 
-    if (mtimeAgents !== null) {
-      const result = await readJsonFile<unknown[]>(agentsPath, AGENTS_FILE, 'agents')
-      if (result.warning) incoming.warnings.push(result.warning)
-      if (result.data) {
-        for (const raw of result.data) {
-          const { agent, warning } = normalizeAgent(raw, agentsPath)
-          if (warning) incoming.warnings.push(warning)
-          if (agent) incoming.agents.set(agent.id, { ...agent, source: agentsPath } as Agent)
-        }
-        incoming.sources.push(agentsPath)
+    const agentsCollection = await readConfigCollection<unknown>(root, 'agents')
+    if (agentsCollection.warning) incoming.warnings.push(agentsCollection.warning)
+    if (agentsCollection.items) {
+      for (const raw of agentsCollection.items) {
+        const source = agentsCollection.source ?? root
+        const { agent, warning } = normalizeAgent(raw, source)
+        if (warning) incoming.warnings.push(warning)
+        if (agent) incoming.agents.set(agent.id, { ...agent, source } as Agent)
+      }
+      if (agentsCollection.source) {
+        incoming.sources.push(agentsCollection.source)
       }
     }
 
-    if (mtimeFlows !== null) {
-      const result = await readJsonFile<unknown[]>(flowsPath, FLOWS_FILE, 'flows')
-      if (result.warning) incoming.warnings.push(result.warning)
-      if (result.data) {
-        for (const raw of result.data) {
-          const { flow, warning } = normalizeFlow(raw, flowsPath)
-          if (warning) incoming.warnings.push(warning)
-          if (flow) incoming.flows.set(flow.id, { ...flow, source: flowsPath } as Flow)
-        }
-        incoming.sources.push(flowsPath)
+    const flowsCollection = await readConfigCollection<unknown>(root, 'flows')
+    if (flowsCollection.warning) incoming.warnings.push(flowsCollection.warning)
+    if (flowsCollection.items) {
+      for (const raw of flowsCollection.items) {
+        const source = flowsCollection.source ?? root
+        const { flow, warning } = normalizeFlow(raw, source)
+        if (warning) incoming.warnings.push(warning)
+        if (flow) incoming.flows.set(flow.id, { ...flow, source } as Flow)
+      }
+      if (flowsCollection.source) {
+        incoming.sources.push(flowsCollection.source)
       }
     }
 
@@ -424,24 +513,34 @@ export async function loadConfig(): Promise<LoadedConfig> {
       incoming.skills.set(skill.id, skill)
     }
 
+    const rootAgentMarkdown = await loadAgentMarkdownFiles(path.join(root, 'agents'))
+    incoming.warnings.push(...rootAgentMarkdown.warnings)
+    for (const agent of rootAgentMarkdown.agents) {
+      if (incoming.agents.has(agent.id)) {
+        incoming.warnings.push(`Agent "${agent.id}" overridden by ${agent.source}`)
+      }
+      incoming.agents.set(agent.id, agent)
+      if (agent.source) incoming.sources.push(agent.source)
+    }
+
     // Load external config importers
     const rootName = path.basename(root)
     if (rootName === '.opencode') {
       const external = await loadOpenCodeConfig(root)
-      for (const [id, agent] of external.agents) incoming.agents.set(id, agent)
-      for (const [id, flow] of external.flows) incoming.flows.set(id, flow)
+      incoming.imports.push(external)
+      incoming.warnings.push(`[import] Imported config from ${external.origin} quarantined as migration input (${external.agents.length} agent${external.agents.length === 1 ? '' : 's'}).`)
       incoming.warnings.push(...external.warnings)
       incoming.sources.push(...external.sources)
     } else if (rootName === '.claude') {
       const external = await loadClaudeConfig(root)
-      for (const [id, agent] of external.agents) incoming.agents.set(id, agent)
-      for (const [id, flow] of external.flows) incoming.flows.set(id, flow)
+      incoming.imports.push(external)
+      incoming.warnings.push(`[import] Imported config from ${external.origin} quarantined as migration input (${external.agents.length} agent${external.agents.length === 1 ? '' : 's'}).`)
       incoming.warnings.push(...external.warnings)
       incoming.sources.push(...external.sources)
     } else if (rootName === '.codex') {
       const external = await loadCodexConfig(root)
-      for (const [id, agent] of external.agents) incoming.agents.set(id, agent)
-      for (const [id, flow] of external.flows) incoming.flows.set(id, flow)
+      incoming.imports.push(external)
+      incoming.warnings.push(`[import] Imported config from ${external.origin} quarantined as migration input (${external.agents.length} agent${external.agents.length === 1 ? '' : 's'}).`)
       incoming.warnings.push(...external.warnings)
       incoming.sources.push(...external.sources)
     }
@@ -464,7 +563,8 @@ export async function loadConfig(): Promise<LoadedConfig> {
 
   ensureDefaultAgent(merged)
 
-  configCache = { signature: await computeConfigSignature(roots), data: merged }
+  merged.signature = await computeConfigSignature(roots)
+  configCache = { signature: merged.signature, data: merged }
   return merged
 }
 

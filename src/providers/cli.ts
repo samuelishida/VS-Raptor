@@ -27,11 +27,55 @@ export interface CliProviderDefinition {
 export interface CliProviderRuntimeConfig {
   command?: string
   defaultModel?: string
-  apiKey?: string
 }
 
 const WIN_ARGV_SAFE_LIMIT = 8000
 const RESOLVE_COMMAND_TIMEOUT_MS = 5000
+const SAFE_ENV_KEYS = [
+  'HOME',
+  'USERPROFILE',
+  'PATH',
+  'SHELL',
+  'TERM',
+  'TMP',
+  'TMPDIR',
+  'TEMP',
+  'SystemRoot',
+  'COMSPEC',
+  'LANG',
+  'LC_ALL',
+  'CI',
+  'SSH_AUTH_SOCK',
+  'GIT_SSH_COMMAND',
+  'XDG_CONFIG_HOME',
+  'XDG_CACHE_HOME',
+  'XDG_STATE_HOME',
+  'XDG_DATA_HOME',
+] as const
+
+const NEGATIVE_ENV_KEYS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'OPENAI_API_KEY',
+  'OPENAI_ORG_ID',
+  'OPENAI_PROJECT_ID',
+  'OPENROUTER_API_KEY',
+  'HF_API_TOKEN',
+  'GEMINI_API_KEY',
+  'COHERE_API_KEY',
+  'AZURE_OPENAI_ENDPOINT',
+  'AZURE_OPENAI_KEY',
+  'AZURE_OPENAI_API_KEY',
+  'SLACK_BOT_TOKEN',
+  'SLACK_BOT_CERT',
+  'SLACK_BOT_PRIVATE_KEY',
+  'GITHUB_TOKEN',
+  'GIT_TOKEN',
+  'NPM_TOKEN',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'FIREBASE_TOKEN',
+] as const
 
 function unquoteCommand(cmd: string): string {
   const trimmed = cmd.trim()
@@ -162,10 +206,13 @@ export function createCliProvider(
   }
 
   function getModels(): RaptorModel[] {
+    if (!defaultModel || defaultModel === 'default') {
+      return baseModels
+    }
     if (defaultModel) {
       const withDefault: RaptorModel[] = [
         { id: 'default', name: `${definition.name} Default (${defaultModel})`, providerId: definition.id },
-        ...baseModels,
+        ...baseModels.filter(model => model.id !== 'default'),
       ]
       return withDefault
     }
@@ -214,7 +261,7 @@ export function createCliProvider(
       const effectiveModel = model.id === 'default' && defaultModel ? { ...model, id: defaultModel } : model
       const args = definition.argsForModel(effectiveModel, promptText)
       const cwd = getCwd(definition.cwdPolicy)
-      const env = buildEnv(definition.envKeys, config)
+      const env = buildEnv(definition.envKeys)
 
       return streamCliCommand(
         resolved.command,
@@ -243,10 +290,20 @@ function getCwd(policy: CliProviderDefinition['cwdPolicy']): string {
   }
 }
 
-function buildEnv(keys: string[] = [], config: CliProviderRuntimeConfig = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env }
-  if (config.apiKey && keys.length > 0) {
-    env[keys[0]] = config.apiKey
+function buildEnv(keys: string[] = []): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  const allowed = new Set<string>([...SAFE_ENV_KEYS, ...keys])
+  for (const key of allowed) {
+    const value = process.env[key]
+    if (value !== undefined) {
+      env[key] = value
+    }
+  }
+  // Explicitly exclude ambient secrets, but keep provider-requested auth keys.
+  const explicitKeys = new Set(keys)
+  for (const neg of NEGATIVE_ENV_KEYS) {
+    if (explicitKeys.has(neg)) continue
+    delete env[neg]
   }
   return env
 }

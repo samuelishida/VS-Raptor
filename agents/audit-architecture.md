@@ -1,7 +1,11 @@
 ---
 name: audit-architecture
 description: Architecture & conventions specialist for hawk-skills code audits. Reviews diffs for layer separation, file placement, import direction, type-safety regressions, observability gaps, and public API stability. Used internally by hawk-skills audit fan-out — not intended for direct invocation.
-tools: Read, Grep, Glob, Bash
+permission:
+  read: allow
+  grep: allow
+  glob: allow
+  bash: allow
 model: sonnet
 ---
 

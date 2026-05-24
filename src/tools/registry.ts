@@ -1,5 +1,27 @@
 import * as vscode from 'vscode'
 
+export const DEFAULT_ORCHESTRATION_TOOL_NAMES = [
+  'readFile',
+  'listDir',
+  'glob',
+  'searchCode',
+  'getDiagnostics',
+  'lsp',
+]
+
+export const SUB_AGENT_DEFAULT_TOOL_NAMES = [
+  'readFile',
+  'writeFile',
+  'editFile',
+  'multiEdit',
+  'listDir',
+  'glob',
+  'searchCode',
+  'runTerminal',
+  'getDiagnostics',
+  'lsp',
+]
+
 export function getToolDefs(): vscode.LanguageModelChatTool[] {
   return [
     {
@@ -145,57 +167,6 @@ export function getToolDefs(): vscode.LanguageModelChatTool[] {
           path:     { type: 'string', description: 'File to check. Omit to check all open files.' },
           severity: { type: 'string', enum: ['error', 'warning', 'all'], description: 'Filter by severity (default: all)' },
         },
-      },
-    },
-    {
-      name: 'todoWrite',
-      description: 'Persist a structured todo list to the current workspace .raptor/todos.json.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          todos: {
-            type: 'array',
-            description: 'Array of todo items',
-            items: {
-              type: 'object',
-              properties: {
-                id:       { type: 'string' },
-                content:  { type: 'string' },
-                status:   { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
-                priority: { type: 'string', enum: ['low', 'medium', 'high'] },
-              },
-              required: ['id', 'content', 'status'],
-            },
-          },
-        },
-        required: ['todos'],
-      },
-    },
-    {
-      name: 'memoryRead',
-      description: 'Read persistent memory. scope="project" (default) reads workspace-specific facts. scope="global" reads user-wide facts. scope="all" reads both.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          scope: { type: 'string', enum: ['all', 'global', 'project'], description: 'Which memory to read (default: project)' },
-        },
-      },
-    },
-    {
-      name: 'memoryWrite',
-      description:
-        'Write or update a memory entry. scope="project" (default) for workspace-specific facts (architecture, build commands, known issues). ' +
-        'scope="global" for explicitly user-wide facts (preferences, patterns). ' +
-        'Memories persist across sessions and are auto-injected into context.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          topic:   { type: 'string', description: 'Topic heading (e.g. "project-structure", "user-preferences", "build-commands")' },
-          content: { type: 'string', description: 'The memory content to save' },
-          replace: { type: 'boolean', description: 'Replace existing section with same topic (default: false = append)' },
-          scope:   { type: 'string', enum: ['global', 'project'], description: 'Where to save: project (<workspace>/.raptor/) or global (~/.raptor/). Default: project' },
-        },
-        required: ['content'],
       },
     },
     {

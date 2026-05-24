@@ -1,68 +1,39 @@
-import * as fs from 'fs/promises'
-import * as path from 'path'
-import type { Agent, Flow } from '../loader'
+import type { Agent, ImportedConfig } from '../loader'
+import { readConfigCollection } from '../serde'
 
-export interface PartialLoadedConfig {
-  agents: Map<string, Agent>
-  flows: Map<string, Flow>
-  warnings: string[]
-  sources: string[]
-}
-
-export async function loadOpenCodeConfig(root: string): Promise<PartialLoadedConfig> {
-  const result: PartialLoadedConfig = {
-    agents: new Map(),
-    flows: new Map(),
-    warnings: [],
+export async function loadOpenCodeConfig(root: string): Promise<ImportedConfig> {
+  const result: ImportedConfig = {
+    origin: 'opencode',
     sources: [],
+    agents: [],
+    flows: [],
+    warnings: [],
   }
 
-  const configPath = path.join(root, 'agents.json')
-  try {
-    const text = await fs.readFile(configPath, 'utf-8')
-    const parsed = JSON.parse(text)
-    
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (typeof item === 'object' && item.id) {
-          const agent: Agent = {
-            id: String(item.id),
-            name: item.name ? String(item.name) : undefined,
-            description: item.description ? String(item.description) : undefined,
-            prompt: item.instructions ? String(item.instructions) : undefined,
-            model: item.model ? normalizeModelSpec(String(item.model)) : undefined,
-            skills: Array.isArray(item.skills) ? item.skills.map(String) : undefined,
-            tools: Array.isArray(item.tools) ? item.tools.map(String) : undefined,
-            source: configPath,
-          }
-          result.agents.set(agent.id, agent)
+  const config = await readConfigCollection<unknown>(root, 'agents')
+  if (config.warning) {
+    result.warnings.push(`OpenCode config: ${config.warning}`)
+  }
+
+  if (config.items && config.source) {
+    for (const item of config.items) {
+      if (typeof item === 'object' && item && 'id' in item) {
+        const raw = item as Record<string, unknown>
+        if (!raw.id) continue
+        const agent: Agent = {
+          id: String(raw.id),
+          name: typeof raw.name === 'string' ? raw.name : undefined,
+          description: typeof raw.description === 'string' ? raw.description : undefined,
+          prompt: typeof raw.instructions === 'string' ? raw.instructions : undefined,
+          model: typeof raw.model === 'string' ? normalizeModelSpec(raw.model) : undefined,
+          skills: Array.isArray(raw.skills) ? raw.skills.map(String) : undefined,
+          tools: Array.isArray(raw.tools) ? raw.tools.map(String) : undefined,
+          source: config.source,
         }
-      }
-      result.sources.push(configPath)
-    } else if (parsed && typeof parsed === 'object') {
-      if (Array.isArray(parsed.agents)) {
-        for (const item of parsed.agents) {
-          if (typeof item === 'object' && item.id) {
-            const agent: Agent = {
-              id: String(item.id),
-              name: item.name ? String(item.name) : undefined,
-              description: item.description ? String(item.description) : undefined,
-              prompt: item.instructions ? String(item.instructions) : undefined,
-              model: item.model ? normalizeModelSpec(String(item.model)) : undefined,
-              skills: Array.isArray(item.skills) ? item.skills.map(String) : undefined,
-              tools: Array.isArray(item.tools) ? item.tools.map(String) : undefined,
-              source: configPath,
-            }
-            result.agents.set(agent.id, agent)
-          }
-        }
-        result.sources.push(configPath)
+        result.agents.push(agent)
       }
     }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      result.warnings.push(`Failed to load OpenCode config: ${String(err)}`)
-    }
+    result.sources.push(config.source)
   }
 
   return result
@@ -74,5 +45,5 @@ function normalizeModelSpec(spec: string): string {
   if (colonIdx > 0) {
     return trimmed
   }
-  return `openai:${trimmed}`
+  return `opencode:${trimmed}`
 }

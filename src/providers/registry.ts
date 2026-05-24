@@ -37,6 +37,11 @@ function pickModelByVendorAndId(
   spec: string,
   providerId?: string,
 ): RaptorModel {
+  // Validate input parameters
+  if (!spec || typeof spec !== 'string' || spec.trim() === '') {
+    throw new ProviderError(providerId ?? 'registry', 'invalid-spec', 'Model spec is empty or invalid.')
+  }
+
   if (models.length === 0) {
     console.warn('[Model Registry] Empty models array passed to pickModelByVendorAndId')
     throw new ProviderError(providerId ?? 'registry', 'no-models', 'No models available to select from.')
@@ -78,7 +83,10 @@ function resolveExplicitProviderModel(
   providerId: string,
 ): RaptorModel {
   const parsed = parseModelSpec(spec)
-  const modelHint = parsed.model
+  const modelHint = parsed.model.trim()
+  if (!modelHint) {
+    throw new ProviderError(providerId, 'invalid-spec', 'Model spec is empty or invalid.')
+  }
   try {
     return pickModelByVendorAndId(available, spec, providerId)
   } catch (err) {
@@ -210,9 +218,18 @@ async function resolveFallback(
   const defaultProviderId = vscode.workspace.getConfiguration('raptor').get<string>('defaultProvider')
   const preferredModel = input.fallbackModel ?? vscode.workspace.getConfiguration('raptor').get<string>('model', 'claude-sonnet-4.6')
 
-  const ordered = defaultProviderId
-    ? [providers.get(defaultProviderId), ...providers.values()].filter(Boolean) as ModelProvider[]
-    : Array.from(providers.values())
+  const ordered: ModelProvider[] = []
+  if (defaultProviderId) {
+    const preferredProvider = providers.get(defaultProviderId)
+    if (preferredProvider) {
+      ordered.push(preferredProvider)
+    }
+  }
+  for (const provider of providers.values()) {
+    if (!ordered.includes(provider)) {
+      ordered.push(provider)
+    }
+  }
 
   for (const p of ordered) {
     if (p.capability === 'unavailable') continue

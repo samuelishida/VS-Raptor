@@ -1,7 +1,13 @@
 ---
 name: audit-research
 description: Online research specialist for hawk-skills code audits. Verifies third-party imports, framework calls, and non-obvious APIs against current docs via WebSearch and WebFetch. Flags deprecated APIs and version-specific gotchas. Used internally by hawk-skills audit fan-out — not intended for direct invocation.
-tools: Read, Grep, Glob, Bash, WebSearch, WebFetch
+permission:
+  read: allow
+  grep: allow
+  glob: allow
+  bash: allow
+  websearch: allow
+  webfetch: allow
 model: sonnet
 ---
 

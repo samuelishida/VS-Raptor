@@ -1,20 +1,14 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
-import type { Agent, Flow } from '../loader'
+import type { Agent, Flow, ImportedConfig } from '../loader'
 
-export interface PartialLoadedConfig {
-  agents: Map<string, Agent>
-  flows: Map<string, Flow>
-  warnings: string[]
-  sources: string[]
-}
-
-export async function loadCodexConfig(root: string): Promise<PartialLoadedConfig> {
-  const result: PartialLoadedConfig = {
-    agents: new Map(),
-    flows: new Map(),
-    warnings: [],
+export async function loadCodexConfig(root: string): Promise<ImportedConfig> {
+  const result: ImportedConfig = {
+    origin: 'codex',
     sources: [],
+    agents: [],
+    flows: [],
+    warnings: [],
   }
 
   const configPath = path.join(root, 'config.toml')
@@ -30,7 +24,7 @@ export async function loadCodexConfig(root: string): Promise<PartialLoadedConfig
         model: `codex:${modelMatch[1]}`,
         source: configPath,
       }
-      result.agents.set(agent.id, agent)
+      result.agents.push(agent)
       result.sources.push(configPath)
     }
   } catch (err) {
@@ -52,7 +46,7 @@ export async function loadCodexConfig(root: string): Promise<PartialLoadedConfig
       model: 'codex:default',
       source: instructionsPath,
     }
-    result.agents.set(agent.id, agent)
+    result.agents.push(agent)
     result.sources.push(instructionsPath)
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {

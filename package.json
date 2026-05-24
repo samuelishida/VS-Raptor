@@ -2,7 +2,7 @@
 	"name": "raptor",
 	"displayName": "Raptor",
 	"version": "0.2.0",
-	"description": "Agent orchestrator — routes tasks to specialist skills and builds custom agent flows. Works as a VS Code extension, Claude Code plugin, and skill pack for Codex CLI / OpenCode / any tool that accepts a system prompt.",
+	"description": "Deterministic agent orchestration for skills, specialist agents, and custom flows. Works as a VS Code extension, Claude Code plugin, and skill pack for Codex CLI / OpenCode / any tool that accepts a system prompt.",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -28,9 +28,15 @@
 		".claude-plugin/",
 		"skills/",
 		"agents/",
+		"install.sh",
+		"uninstall.sh",
 		"plugin.json",
 		"README.md"
 	],
+	"bin": {
+		"raptor-install": "./install.sh",
+		"raptor-uninstall": "./uninstall.sh"
+	},
 	"categories": [
 		"Other",
 		"AI"
@@ -39,7 +45,11 @@
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
 		"compile": "tsc -p ./",
-		"watch": "tsc -watch --p \"./\""
+		"watch": "tsc -watch --p \"./\"",
+		"install:skills": "./install.sh",
+		"setup": "npm run compile && chmod +x install.sh uninstall.sh",
+		"validate:inventory": "node ./scripts/validate-inventory.mjs",
+		"smoke:orchestration": "node ./scripts/smoke-orchestration.mjs"
 	},
 	"devDependencies": {
 		"@types/node": "^20",
@@ -51,42 +61,22 @@
 	},
 	"publisher": "samuelishida",
 	"activationEvents": [
-		"onChatParticipant:raptor.agent",
-		"onCommand:raptor.openPanel",
-		"onCommand:raptor.runInTerminal",
-		"onCommand:raptor.steer",
-		"onCommand:raptor.setProviderApiKey",
-		"onCommand:raptor.clearProviderApiKey"
+		"onChatParticipant:raptor",
+		"onCommand:raptor.openPanel"
 	],
 	"contributes": {
 		"commands": [
 			{
 				"command": "raptor.openPanel",
 				"title": "raptor: Open Chat Panel"
-			},
-			{
-				"command": "raptor.runInTerminal",
-				"title": "raptor: Run Selection In Terminal"
-			},
-			{
-				"command": "raptor.steer",
-				"title": "raptor: Steer Running Agent"
-			},
-			{
-				"command": "raptor.setProviderApiKey",
-				"title": "raptor: Set Provider API Key (SecretStorage)"
-			},
-			{
-				"command": "raptor.clearProviderApiKey",
-				"title": "raptor: Clear Provider API Key"
 			}
 		],
 		"chatParticipants": [
 			{
-				"id": "raptor.agent",
+				"id": "raptor",
 				"name": "raptor",
 				"fullName": "raptor Agent",
-				"description": "Agent orchestrator — routes tasks to specialist skills, builds agent flows, and runs multi-step automations.",
+				"description": "Agent orchestrator for skills, specialist agents, and flow execution.",
 				"isSticky": true,
 				"commands": [
 					{
@@ -94,24 +84,8 @@
 						"description": "Show help and available tools"
 					},
 					{
-						"name": "memory",
-						"description": "Show saved project memory"
-					},
-					{
-						"name": "resume",
-						"description": "Resume from previous workspace session context"
-					},
-					{
-						"name": "todos",
-						"description": "Show current workspace todo list"
-					},
-					{
-						"name": "clearmemory",
-						"description": "Clear project memory"
-					},
-					{
-						"name": "steer",
-						"description": "Inject guidance into a running session"
+						"name": "skills",
+						"description": "List loaded skills"
 					},
 					{
 						"name": "agents",
@@ -119,24 +93,24 @@
 					},
 					{
 						"name": "agent",
-						"description": "Switch to a specific agent"
+						"description": "Inspect or run a request-scoped agent"
 					},
-				{
-					"name": "flows",
-					"description": "List loaded flows"
-				},
-				{
-					"name": "flow",
-					"description": "Run a flow: /flow <id> [--resume] [--accept-models] [--keep-current] [--chat]. Use /flow --list to see saved states, /flow <id> --memory to view saved summary."
-				},
-				{
-					"name": "models",
-					"description": "List available providers and models"
-				},
-				{
-					"name": "build-flow",
-					"description": "Design and build an agent flow for this project"
-				}
+					{
+						"name": "flows",
+						"description": "List loaded flows"
+					},
+					{
+						"name": "flow",
+						"description": "Run a deterministic flow: /flow <id> [--resume] [--memory] [--list]"
+					},
+					{
+						"name": "models",
+						"description": "List available providers and models"
+					},
+					{
+						"name": "build-flow",
+						"description": "Design and build an agent flow for this project (defaults inferred when omitted)"
+					}
 				]
 			}
 		],
@@ -163,12 +137,12 @@
 				"raptor.defaultProvider": {
 					"type": "string",
 					"default": "vscode",
-					"enum": ["vscode", "anthropic", "openai", "openrouter", "ollama", "claude-code", "codex", "opencode"],
+					"enum": ["vscode", "claude-code", "codex", "opencode"],
 					"description": "Default provider to use when no model is specified."
 				},
 				"raptor.providers.enabled": {
 					"type": "object",
-					"default": { "anthropic": false, "openai": false, "openrouter": false, "ollama": true, "claude-code": false, "codex": false, "opencode": false },
+					"default": { "claude-code": false, "codex": false, "opencode": false },
 					"description": "Enable/disable individual providers."
 				},
 				"raptor.provider.claude-code.command": {
@@ -200,32 +174,13 @@
 					"type": "string",
 					"default": "default",
 					"description": "Default model for OpenCode CLI."
-				},
-				"raptor.provider.anthropic.apiKey": {
-					"type": "string",
-					"default": "",
-					"description": "[Deprecated] Anthropic API key. Use VS Code SecretStorage (command: raptor.setProviderApiKey) instead."
-				},
-				"raptor.provider.openai.apiKey": {
-					"type": "string",
-					"default": "",
-					"description": "[Deprecated] OpenAI API key. Use VS Code SecretStorage (command: raptor.setProviderApiKey) instead."
-				},
-				"raptor.provider.openrouter.apiKey": {
-					"type": "string",
-					"default": "",
-					"description": "[Deprecated] OpenRouter API key. Use VS Code SecretStorage (command: raptor.setProviderApiKey) instead."
-				},
-				"raptor.provider.ollama.baseUrl": {
-					"type": "string",
-					"default": "http://localhost:11434",
-					"description": "Ollama server base URL."
 				}
 			}
 		}
 	},
 	"dependencies": {
-		"vsce": "^2.15.0"
+		"vsce": "^2.15.0",
+		"yaml": "^2.9.0"
 	},
 	"__metadata": {
 		"installedTimestamp": 1775461056055,
